@@ -1,0 +1,71 @@
+run:
+  mode: all
+  output_dir: src/GCOPTER/gcopter/benchmark_runs/20260417_094603
+instances:
+  num_instances: 100
+  generator_seed: 20260417
+  max_map_attempts_per_instance: 50
+  start_goal_attempts_per_map: 50
+  min_start_goal_distance: 8.0
+map:
+  bound:
+  - -25.0
+  - 25.0
+  - -25.0
+  - 25.0
+  - 0.0
+  - 5.0
+  voxel_width: 0.25
+  dilate_radius: 0.5
+generator:
+  obstacle_number: 10
+  obstacle_width_min: 0.6
+  obstacle_width_max: 1.5
+planner:
+  time_weight: 20.0
+  length_per_piece: 1.0e18
+  smoothing_eps: 0.01
+  integral_intervals: 16
+  magnitude_bounds:
+  - 4.0
+  - 2.1
+  - 1.05
+  - 2.0
+  - 12.0
+  penalty_weights:
+  - 1.0e4
+  - 1.0e4
+  - 1.0e4
+  - 1.0e4
+  - 1.0e5
+  physical_params:
+  - 0.61
+  - 9.8
+  - 0.7
+  - 0.8
+  - 0.01
+  - 0.0001
+benchmark:
+  feasibility_tolerance: 0.0001
+  lbfgs:
+    rel_cost_tol: 1.0e-05
+    max_iterations: 200
+    max_evaluations: 500
+    max_wall_time: 0.5
+  igo:
+    population: 32
+    max_iterations: 200
+    max_evaluations: 500
+    max_wall_time: 0.5
+    tau_box_radius: 2.5
+    xi_box_bound: 1.5
+    min_sigma: 0.001
+    eta_mean: 0.45
+    eta_sigma: 0.2
+    elite_ratio: 0.35
+    seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4

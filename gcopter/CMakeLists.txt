@@ -8,6 +8,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -fPIC")
 
 find_package(Eigen3 REQUIRED)
 find_package(ompl REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -27,8 +28,21 @@ include_directories(
 catkin_package()
 
 add_executable(global_planning src/global_planning.cpp)
+add_executable(minco_benchmark src/minco_benchmark.cpp)
+add_executable(compare_planning src/compare_planning.cpp)
 
 target_link_libraries(global_planning
+  ${OMPL_LIBRARIES}
+  ${catkin_LIBRARIES}
+)
+
+target_link_libraries(minco_benchmark
+  ${OMPL_LIBRARIES}
+  ${catkin_LIBRARIES}
+  yaml-cpp
+)
+
+target_link_libraries(compare_planning
   ${OMPL_LIBRARIES}
   ${catkin_LIBRARIES}
 )

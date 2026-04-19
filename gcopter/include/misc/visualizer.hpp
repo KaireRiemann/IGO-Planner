@@ -20,6 +20,31 @@
 // Visualizer for the planner
 class Visualizer
 {
+public:
+    struct Color
+    {
+        double r = 1.0;
+        double g = 1.0;
+        double b = 1.0;
+        double a = 1.0;
+    };
+
+    struct Style
+    {
+        std::string topicPrefix = "/visualizer";
+        Color routeColor{1.0, 0.0, 0.0, 1.0};
+        Color waypointsColor{1.0, 0.0, 0.0, 1.0};
+        Color trajectoryColor{0.0, 0.5, 1.0, 1.0};
+        Color meshColor{0.0, 0.0, 1.0, 0.15};
+        Color edgeColor{0.0, 1.0, 1.0, 1.0};
+        Color sphereColor{0.0, 0.0, 1.0, 1.0};
+        Color startGoalColor{1.0, 0.0, 0.0, 1.0};
+        double routeWidth = 0.1;
+        double waypointScale = 0.35;
+        double trajectoryWidth = 0.30;
+        double edgeWidth = 0.02;
+    };
+
 private:
     // config contains the scale for some markers
     ros::NodeHandle nh;
@@ -33,6 +58,7 @@ private:
     ros::Publisher meshPub;
     ros::Publisher edgePub;
     ros::Publisher spherePub;
+    Style style;
 
 public:
     ros::Publisher speedPub;
@@ -44,24 +70,46 @@ public:
     Visualizer(ros::NodeHandle &nh_)
         : nh(nh_)
     {
-        routePub = nh.advertise<visualization_msgs::Marker>("/visualizer/route", 10);
-        wayPointsPub = nh.advertise<visualization_msgs::Marker>("/visualizer/waypoints", 10);
-        trajectoryPub = nh.advertise<visualization_msgs::Marker>("/visualizer/trajectory", 10);
-        meshPub = nh.advertise<visualization_msgs::Marker>("/visualizer/mesh", 1000);
-        edgePub = nh.advertise<visualization_msgs::Marker>("/visualizer/edge", 1000);
-        spherePub = nh.advertise<visualization_msgs::Marker>("/visualizer/spheres", 1000);
-        speedPub = nh.advertise<std_msgs::Float64>("/visualizer/speed", 1000);
-        thrPub = nh.advertise<std_msgs::Float64>("/visualizer/total_thrust", 1000);
-        tiltPub = nh.advertise<std_msgs::Float64>("/visualizer/tilt_angle", 1000);
-        bdrPub = nh.advertise<std_msgs::Float64>("/visualizer/body_rate", 1000);
+        style = Style();
+        initializePublishers();
     }
 
-    // Visualize the trajectory and its front-end path
-    template <int D>
-    inline void visualize(const Trajectory<D> &traj,
-                          const std::vector<Eigen::Vector3d> &route)
+    Visualizer(ros::NodeHandle &nh_,
+               const Style &style_)
+        : nh(nh_),
+          style(style_)
     {
-        visualization_msgs::Marker routeMarker, wayPointsMarker, trajMarker;
+        initializePublishers();
+    }
+
+private:
+    inline void initializePublishers()
+    {
+        routePub = nh.advertise<visualization_msgs::Marker>(style.topicPrefix + "/route", 10);
+        wayPointsPub = nh.advertise<visualization_msgs::Marker>(style.topicPrefix + "/waypoints", 10);
+        trajectoryPub = nh.advertise<visualization_msgs::Marker>(style.topicPrefix + "/trajectory", 10);
+        meshPub = nh.advertise<visualization_msgs::Marker>(style.topicPrefix + "/mesh", 1000);
+        edgePub = nh.advertise<visualization_msgs::Marker>(style.topicPrefix + "/edge", 1000);
+        spherePub = nh.advertise<visualization_msgs::Marker>(style.topicPrefix + "/spheres", 1000);
+        speedPub = nh.advertise<std_msgs::Float64>(style.topicPrefix + "/speed", 1000);
+        thrPub = nh.advertise<std_msgs::Float64>(style.topicPrefix + "/total_thrust", 1000);
+        tiltPub = nh.advertise<std_msgs::Float64>(style.topicPrefix + "/tilt_angle", 1000);
+        bdrPub = nh.advertise<std_msgs::Float64>(style.topicPrefix + "/body_rate", 1000);
+    }
+
+    inline void applyColor(visualization_msgs::Marker &marker,
+                           const Color &color) const
+    {
+        marker.color.r = color.r;
+        marker.color.g = color.g;
+        marker.color.b = color.b;
+        marker.color.a = color.a;
+    }
+
+public:
+    inline void visualizeRoute(const std::vector<Eigen::Vector3d> &route)
+    {
+        visualization_msgs::Marker routeMarker;
 
         routeMarker.id = 0;
         routeMarker.type = visualization_msgs::Marker::LINE_LIST;
@@ -70,31 +118,8 @@ public:
         routeMarker.pose.orientation.w = 1.00;
         routeMarker.action = visualization_msgs::Marker::ADD;
         routeMarker.ns = "route";
-        routeMarker.color.r = 1.00;
-        routeMarker.color.g = 0.00;
-        routeMarker.color.b = 0.00;
-        routeMarker.color.a = 1.00;
-        routeMarker.scale.x = 0.1;
-
-        wayPointsMarker = routeMarker;
-        wayPointsMarker.id = -wayPointsMarker.id - 1;
-        wayPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
-        wayPointsMarker.ns = "waypoints";
-        wayPointsMarker.color.r = 1.00;
-        wayPointsMarker.color.g = 0.00;
-        wayPointsMarker.color.b = 0.00;
-        wayPointsMarker.scale.x = 0.35;
-        wayPointsMarker.scale.y = 0.35;
-        wayPointsMarker.scale.z = 0.35;
-
-        trajMarker = routeMarker;
-        trajMarker.header.frame_id = "odom";
-        trajMarker.id = 0;
-        trajMarker.ns = "trajectory";
-        trajMarker.color.r = 0.00;
-        trajMarker.color.g = 0.50;
-        trajMarker.color.b = 1.00;
-        trajMarker.scale.x = 0.30;
+        applyColor(routeMarker, style.routeColor);
+        routeMarker.scale.x = style.routeWidth;
 
         if (route.size() > 0)
         {
@@ -123,6 +148,44 @@ public:
 
             routePub.publish(routeMarker);
         }
+    }
+
+    inline void clear()
+    {
+        visualization_msgs::Marker marker;
+        marker.header.stamp = ros::Time::now();
+        marker.header.frame_id = "odom";
+        marker.action = visualization_msgs::Marker::DELETEALL;
+        routePub.publish(marker);
+        wayPointsPub.publish(marker);
+        trajectoryPub.publish(marker);
+        meshPub.publish(marker);
+        edgePub.publish(marker);
+        spherePub.publish(marker);
+    }
+
+    template <int D>
+    inline void visualizeTrajectory(const Trajectory<D> &traj)
+    {
+        visualization_msgs::Marker wayPointsMarker, trajMarker;
+
+        wayPointsMarker.id = 0;
+        wayPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
+        wayPointsMarker.header.stamp = ros::Time::now();
+        wayPointsMarker.header.frame_id = "odom";
+        wayPointsMarker.pose.orientation.w = 1.00;
+        wayPointsMarker.action = visualization_msgs::Marker::ADD;
+        wayPointsMarker.ns = "waypoints";
+        applyColor(wayPointsMarker, style.waypointsColor);
+        wayPointsMarker.scale.x = style.waypointScale;
+        wayPointsMarker.scale.y = style.waypointScale;
+        wayPointsMarker.scale.z = style.waypointScale;
+
+        trajMarker = wayPointsMarker;
+        trajMarker.type = visualization_msgs::Marker::LINE_LIST;
+        trajMarker.ns = "trajectory";
+        applyColor(trajMarker, style.trajectoryColor);
+        trajMarker.scale.x = style.trajectoryWidth;
 
         if (traj.getPieceNum() > 0)
         {
@@ -159,6 +222,15 @@ public:
             }
             trajectoryPub.publish(trajMarker);
         }
+    }
+
+    // Visualize the trajectory and its front-end path
+    template <int D>
+    inline void visualize(const Trajectory<D> &traj,
+                          const std::vector<Eigen::Vector3d> &route)
+    {
+        visualizeRoute(route);
+        visualizeTrajectory(traj);
     }
 
     // Visualize some polytopes in H-representation
@@ -200,10 +272,7 @@ public:
         meshMarker.action = visualization_msgs::Marker::ADD;
         meshMarker.type = visualization_msgs::Marker::TRIANGLE_LIST;
         meshMarker.ns = "mesh";
-        meshMarker.color.r = 0.00;
-        meshMarker.color.g = 0.00;
-        meshMarker.color.b = 1.00;
-        meshMarker.color.a = 0.15;
+        applyColor(meshMarker, style.meshColor);
         meshMarker.scale.x = 1.0;
         meshMarker.scale.y = 1.0;
         meshMarker.scale.z = 1.0;
@@ -211,11 +280,8 @@ public:
         edgeMarker = meshMarker;
         edgeMarker.type = visualization_msgs::Marker::LINE_LIST;
         edgeMarker.ns = "edge";
-        edgeMarker.color.r = 0.00;
-        edgeMarker.color.g = 1.00;
-        edgeMarker.color.b = 1.00;
-        edgeMarker.color.a = 1.00;
-        edgeMarker.scale.x = 0.02;
+        applyColor(edgeMarker, style.edgeColor);
+        edgeMarker.scale.x = style.edgeWidth;
 
         geometry_msgs::Point point;
 
@@ -263,10 +329,7 @@ public:
         sphereMarkers.pose.orientation.w = 1.00;
         sphereMarkers.action = visualization_msgs::Marker::ADD;
         sphereMarkers.ns = "spheres";
-        sphereMarkers.color.r = 0.00;
-        sphereMarkers.color.g = 0.00;
-        sphereMarkers.color.b = 1.00;
-        sphereMarkers.color.a = 1.00;
+        applyColor(sphereMarkers, style.sphereColor);
         sphereMarkers.scale.x = radius * 2.0;
         sphereMarkers.scale.y = radius * 2.0;
         sphereMarkers.scale.z = radius * 2.0;
@@ -297,10 +360,7 @@ public:
         sphereMarkers.pose.orientation.w = 1.00;
         sphereMarkers.action = visualization_msgs::Marker::ADD;
         sphereMarkers.ns = "StartGoal";
-        sphereMarkers.color.r = 1.00;
-        sphereMarkers.color.g = 0.00;
-        sphereMarkers.color.b = 0.00;
-        sphereMarkers.color.a = 1.00;
+        applyColor(sphereMarkers, style.startGoalColor);
         sphereMarkers.scale.x = radius * 2.0;
         sphereMarkers.scale.y = radius * 2.0;
         sphereMarkers.scale.z = radius * 2.0;

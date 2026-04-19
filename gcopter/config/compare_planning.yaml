@@ -1,0 +1,77 @@
+MapTopic: '/voxel_map'
+TargetTopic: '/move_base_simple/goal'
+
+DilateRadius: 0.5
+VoxelWidth: 0.25
+MapBound: [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]
+
+MaxVelMag: 4.0
+MaxBdrMag: 2.1
+MaxTiltAngle: 1.05
+MinThrust: 2.0
+MaxThrust: 12.0
+
+VehicleMass: 0.61
+GravAcc: 9.8
+HorizDrag: 0.70
+VertDrag: 0.80
+ParasDrag: 0.01
+SpeedEps: 0.0001
+
+WeightT: 20.0
+ChiVec: [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5]
+SmoothingEps: 1.0e-2
+IntegralIntervs: 16
+
+FeasibilityTol: 1.0e-4
+RecordPath: ""
+
+LBFGSRelCostTol: 1.0e-5
+LBFGSMaxIterations: 200
+LBFGSMaxEvaluations: 500
+LBFGSMaxWallTime: 0.5
+
+IGOPopulation: 64
+IGOMaxIterations: 200
+IGOMaxEvaluations: 2500
+IGOMaxWallTime: 1.5
+IGOTauBoxRadius: 2.5
+IGOXiBoxBound: 1.5
+IGOSeeds: [0, 1, 2, 3, 4]
+RunMetaOptimizer: true
+IGOMetaSpatialLogitBound: 3.0
+IGOMetaTimeLogitBound: 3.0
+IGOMetaTimeFloorScale: 1.15
+IGOMetaInitialTimeScale: 1.30
+IGOMetaTotalSlackMinScale: 0.10
+IGOMetaTotalSlackMaxScale: 1.20
+IGOArchiveTopK: 12
+IGORefineTopK: 4
+IGOOuterBudgetRatio: 0.45
+IGORefineLBFGSRelCostTol: 1.0e-5
+IGORefineLBFGSMaxIterations: 120
+IGORefineLBFGSMaxEvaluations: 500
+IGORefineLBFGSMaxWallTime: 0.50
+IGORefineLBFGSMemSize: 64
+IGORefineLBFGSPast: 3
+
+MetaOptimizerTimeWeight: 4.0
+MetaOptimizerLengthWeight: 3.0e-2
+MetaOptimizerEnergyWeight: 3.0e+2
+MetaOptimizerCollisionWeight: 60.0
+MetaOptimizerVelocityWeight: 8.0
+MetaOptimizerAccelerationWeight: 30.0
+MetaOptimizerBodyRateWeight: 10.0
+MetaOptimizerTiltWeight: 10.0
+MetaOptimizerThrustWeight: 10.0
+MetaOptimizerMaxAcceleration: 5.5
+MetaOptimizerSampleDt: 0.10
+MetaOptimizerTimeFloorScale: 1.10
+MetaOptimizerInitialTimeScale: 1.18
+MetaOptimizerTotalSlackMinScale: 0.04
+MetaOptimizerTotalSlackMaxScale: 0.65
+MetaOptimizerPopulation: 40
+MetaOptimizerMaxIterations: 120
+MetaOptimizerMaxEvaluations: 760
+MetaOptimizerMaxWallTime: 0.25
+MetaOptimizerSeeds: [0, 1]

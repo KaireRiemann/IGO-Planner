@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cmath>
 #include <cfloat>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -109,17 +110,28 @@ namespace gcopter
             double refine_max_wall_time = 0.50;
             int refine_mem_size = 64;
             int refine_past = 3;
-            double meta_optimizer_time_weight = 1.0;
-            double meta_optimizer_length_weight = 2.0e-2;
-            double meta_optimizer_energy_weight = 1.0e-4;
+            double meta_optimizer_time_weight = 4.0;
+            double meta_optimizer_length_weight = 0.0;
+            double meta_optimizer_energy_weight = 0.0;
+            double meta_optimizer_waypoint_smooth_weight = 0.0;
             double meta_optimizer_collision_weight = 30.0;
             double meta_optimizer_velocity_weight = 20.0;
             double meta_optimizer_acceleration_weight = 25.0;
-            double meta_optimizer_body_rate_weight = 30.0;
-            double meta_optimizer_tilt_weight = 10.0;
-            double meta_optimizer_thrust_weight = 10.0;
-            double meta_optimizer_max_acceleration = 6.0;
+            double meta_optimizer_body_rate_weight = 0.0;
+            double meta_optimizer_tilt_weight = 0.0;
+            double meta_optimizer_thrust_weight = 0.0;
+            double meta_optimizer_max_acceleration = 15.0;
             double meta_optimizer_sample_dt = 0.10;
+            int meta_optimizer_midpoints = 3;
+            double meta_optimizer_time_lb = 0.1;
+            double meta_optimizer_time_ub = 8.0;
+            double meta_optimizer_simple_max_velocity = 4.0;
+            double meta_optimizer_simple_max_acceleration = 15.0;
+            double meta_optimizer_target_velocity_ratio = 0.90;
+            bool meta_optimizer_has_workspace_bounds = false;
+            Eigen::Vector3d meta_optimizer_workspace_min = Eigen::Vector3d::Zero();
+            Eigen::Vector3d meta_optimizer_workspace_max = Eigen::Vector3d::Zero();
+            std::function<bool(const Eigen::Vector3d &)> meta_optimizer_collision_checker;
             double min_sigma = 1.0e-3;
             double eta_mean = 0.45;
             double eta_sigma = 0.20;
@@ -140,6 +152,9 @@ namespace gcopter
             double total_duration = std::numeric_limits<double>::infinity();
             double trajectory_length = std::numeric_limits<double>::infinity();
             Eigen::VectorXd best_x;
+            bool has_meta_direct_solution = false;
+            Eigen::Matrix3Xd meta_direct_points;
+            Eigen::VectorXd meta_direct_times;
             TrajectoryViolationMetrics violations;
             std::string status;
         };
@@ -1843,6 +1858,26 @@ namespace gcopter
 
             jerkOpt.setConditions(headPVA, tailPVA, pieceN);
             jerkOpt.setParameters(candidate_points, candidate_times);
+            return true;
+        }
+
+        inline bool buildMetaDirectJerkOpt(const SolverResult &result,
+                                           minco::MINCO_S3NU &jerkOpt) const
+        {
+            if (!result.has_meta_direct_solution ||
+                result.meta_direct_times.size() <= 0 ||
+                result.meta_direct_points.cols() != result.meta_direct_times.size() - 1 ||
+                !result.meta_direct_times.allFinite() ||
+                !result.meta_direct_points.allFinite() ||
+                (result.meta_direct_times.array() <= positiveEps()).any())
+            {
+                return false;
+            }
+
+            jerkOpt.setConditions(headPVA, tailPVA,
+                                  static_cast<int>(result.meta_direct_times.size()));
+            jerkOpt.setParameters(result.meta_direct_points,
+                                  result.meta_direct_times);
             return true;
         }
 

@@ -153,6 +153,7 @@ namespace
         double metaOptimizerTimeWeight;
         double metaOptimizerLengthWeight;
         double metaOptimizerEnergyWeight;
+        double metaOptimizerWaypointSmoothWeight;
         double metaOptimizerCollisionWeight;
         double metaOptimizerVelocityWeight;
         double metaOptimizerAccelerationWeight;
@@ -161,6 +162,12 @@ namespace
         double metaOptimizerThrustWeight;
         double metaOptimizerMaxAcceleration;
         double metaOptimizerSampleDt;
+        int metaOptimizerMidpoints;
+        double metaOptimizerTimeLowerBound;
+        double metaOptimizerTimeUpperBound;
+        double metaOptimizerSimpleMaxVelocity;
+        double metaOptimizerSimpleMaxAcceleration;
+        double metaOptimizerTargetVelocityRatio;
         double metaOptimizerTimeFloorScale;
         double metaOptimizerInitialTimeScale;
         double metaOptimizerTotalSlackMinScale;
@@ -251,25 +258,31 @@ namespace
             nh_priv.param("IGORefineLBFGSMemSize", igoRefineLBFGSMemSize, 64);
             nh_priv.param("IGORefineLBFGSPast", igoRefineLBFGSPast, 3);
             nh_priv.param("MetaOptimizerTimeWeight", metaOptimizerTimeWeight, 4.0);
-            nh_priv.param("MetaOptimizerLengthWeight", metaOptimizerLengthWeight, 3.0e-2);
-            nh_priv.param("MetaOptimizerEnergyWeight", metaOptimizerEnergyWeight, 1.0e-4);
-            nh_priv.param("MetaOptimizerCollisionWeight", metaOptimizerCollisionWeight, 60.0);
-            nh_priv.param("MetaOptimizerVelocityWeight", metaOptimizerVelocityWeight, 8.0);
-            nh_priv.param("MetaOptimizerAccelerationWeight", metaOptimizerAccelerationWeight, 30.0);
-            nh_priv.param("MetaOptimizerBodyRateWeight", metaOptimizerBodyRateWeight, 30.0);
-            nh_priv.param("MetaOptimizerTiltWeight", metaOptimizerTiltWeight, 10.0);
-            nh_priv.param("MetaOptimizerThrustWeight", metaOptimizerThrustWeight, 10.0);
-            nh_priv.param("MetaOptimizerMaxAcceleration", metaOptimizerMaxAcceleration,
-                          std::max(1.35 * maxVelMag, 5.5));
+            nh_priv.param("MetaOptimizerLengthWeight", metaOptimizerLengthWeight, 0.0);
+            nh_priv.param("MetaOptimizerEnergyWeight", metaOptimizerEnergyWeight, 0.0);
+            nh_priv.param("MetaOptimizerWaypointSmoothWeight", metaOptimizerWaypointSmoothWeight, 0.0);
+            nh_priv.param("MetaOptimizerCollisionWeight", metaOptimizerCollisionWeight, 30.0);
+            nh_priv.param("MetaOptimizerVelocityWeight", metaOptimizerVelocityWeight, 20.0);
+            nh_priv.param("MetaOptimizerAccelerationWeight", metaOptimizerAccelerationWeight, 25.0);
+            nh_priv.param("MetaOptimizerBodyRateWeight", metaOptimizerBodyRateWeight, 0.0);
+            nh_priv.param("MetaOptimizerTiltWeight", metaOptimizerTiltWeight, 0.0);
+            nh_priv.param("MetaOptimizerThrustWeight", metaOptimizerThrustWeight, 0.0);
+            nh_priv.param("MetaOptimizerMaxAcceleration", metaOptimizerMaxAcceleration, 15.0);
             nh_priv.param("MetaOptimizerSampleDt", metaOptimizerSampleDt, 0.10);
+            nh_priv.param("MetaOptimizerMidpoints", metaOptimizerMidpoints, 3);
+            nh_priv.param("MetaOptimizerTimeLowerBound", metaOptimizerTimeLowerBound, 0.10);
+            nh_priv.param("MetaOptimizerTimeUpperBound", metaOptimizerTimeUpperBound, 8.0);
+            nh_priv.param("MetaOptimizerSimpleMaxVelocity", metaOptimizerSimpleMaxVelocity, maxVelMag);
+            nh_priv.param("MetaOptimizerSimpleMaxAcceleration", metaOptimizerSimpleMaxAcceleration, 15.0);
+            nh_priv.param("MetaOptimizerTargetVelocityRatio", metaOptimizerTargetVelocityRatio, 0.90);
             nh_priv.param("MetaOptimizerTimeFloorScale", metaOptimizerTimeFloorScale, 1.10);
             nh_priv.param("MetaOptimizerInitialTimeScale", metaOptimizerInitialTimeScale, 1.18);
             nh_priv.param("MetaOptimizerTotalSlackMinScale", metaOptimizerTotalSlackMinScale, 0.04);
             nh_priv.param("MetaOptimizerTotalSlackMaxScale", metaOptimizerTotalSlackMaxScale, 0.65);
-            nh_priv.param("MetaOptimizerPopulation", metaOptimizerPopulation, 40);
-            nh_priv.param("MetaOptimizerMaxIterations", metaOptimizerMaxIterations, 120);
-            nh_priv.param("MetaOptimizerMaxEvaluations", metaOptimizerMaxEvaluations, 760);
-            nh_priv.param("MetaOptimizerMaxWallTime", metaOptimizerMaxWallTime, 0.25);
+            nh_priv.param("MetaOptimizerPopulation", metaOptimizerPopulation, 50);
+            nh_priv.param("MetaOptimizerMaxIterations", metaOptimizerMaxIterations, 500);
+            nh_priv.param("MetaOptimizerMaxEvaluations", metaOptimizerMaxEvaluations, 0);
+            nh_priv.param("MetaOptimizerMaxWallTime", metaOptimizerMaxWallTime, 0.0);
             if (!nh_priv.getParam("MetaOptimizerSeeds", metaOptimizerSeeds) ||
                 metaOptimizerSeeds.empty())
             {
@@ -998,6 +1011,7 @@ private:
         options.meta_optimizer_time_weight = config.metaOptimizerTimeWeight;
         options.meta_optimizer_length_weight = config.metaOptimizerLengthWeight;
         options.meta_optimizer_energy_weight = config.metaOptimizerEnergyWeight;
+        options.meta_optimizer_waypoint_smooth_weight = config.metaOptimizerWaypointSmoothWeight;
         options.meta_optimizer_collision_weight = config.metaOptimizerCollisionWeight;
         options.meta_optimizer_velocity_weight = config.metaOptimizerVelocityWeight;
         options.meta_optimizer_acceleration_weight = config.metaOptimizerAccelerationWeight;
@@ -1006,6 +1020,29 @@ private:
         options.meta_optimizer_thrust_weight = config.metaOptimizerThrustWeight;
         options.meta_optimizer_max_acceleration = config.metaOptimizerMaxAcceleration;
         options.meta_optimizer_sample_dt = config.metaOptimizerSampleDt;
+        options.meta_optimizer_midpoints = config.metaOptimizerMidpoints;
+        options.meta_optimizer_time_lb = config.metaOptimizerTimeLowerBound;
+        options.meta_optimizer_time_ub = config.metaOptimizerTimeUpperBound;
+        options.meta_optimizer_simple_max_velocity = config.metaOptimizerSimpleMaxVelocity;
+        options.meta_optimizer_simple_max_acceleration = config.metaOptimizerSimpleMaxAcceleration;
+        options.meta_optimizer_target_velocity_ratio = config.metaOptimizerTargetVelocityRatio;
+        if (config.mapBound.size() == 6)
+        {
+            options.meta_optimizer_has_workspace_bounds = true;
+            options.meta_optimizer_workspace_min =
+                Eigen::Vector3d(config.mapBound[0],
+                                config.mapBound[2],
+                                config.mapBound[4]);
+            options.meta_optimizer_workspace_max =
+                Eigen::Vector3d(config.mapBound[1],
+                                config.mapBound[3],
+                                config.mapBound[5]);
+        }
+        options.meta_optimizer_collision_checker =
+            [this](const Eigen::Vector3d &position) -> bool
+        {
+            return voxelMap.query(position);
+        };
         options.seed = static_cast<unsigned int>(seed);
         return options;
     }
@@ -1289,7 +1326,13 @@ private:
         }
         if (haveMetaResult && bestMetaResult.has_solution)
         {
-            haveMetaJerkOpt = solver.buildJerkOpt(bestMetaResult.best_x, metaJerkOpt);
+            haveMetaJerkOpt =
+                solver.buildMetaDirectJerkOpt(bestMetaResult, metaJerkOpt);
+            if (!haveMetaJerkOpt)
+            {
+                haveMetaJerkOpt =
+                    solver.buildJerkOpt(bestMetaResult.best_x, metaJerkOpt);
+            }
             if (haveMetaJerkOpt)
             {
                 metaJerkOpt.getTrajectory(metaTraj);
@@ -1442,15 +1485,15 @@ public:
         const double delta = ros::Time::now().toSec() - trajStamp;
         if (lbfgsTraj.getPieceNum() > 0 && delta >= 0.0 && delta < lbfgsTraj.getTotalDuration())
         {
-            lbfgsVisualizer.visualizeSphere(lbfgsTraj.getPos(delta), 0.30);
+            lbfgsVisualizer.visualizeSphere(lbfgsTraj.getPos(delta), 0.50);
         }
         if (igoTraj.getPieceNum() > 0 && delta >= 0.0 && delta < igoTraj.getTotalDuration())
         {
-            igoVisualizer.visualizeSphere(igoTraj.getPos(delta), 0.30);
+            igoVisualizer.visualizeSphere(igoTraj.getPos(delta), 0.50);
         }
         if (metaTraj.getPieceNum() > 0 && delta >= 0.0 && delta < metaTraj.getTotalDuration())
         {
-            metaVisualizer.visualizeSphere(metaTraj.getPos(delta), 0.30);
+            metaVisualizer.visualizeSphere(metaTraj.getPos(delta), 0.50);
         }
     }
 };

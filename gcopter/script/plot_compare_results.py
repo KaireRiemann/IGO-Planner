@@ -168,9 +168,9 @@ def write_solver_mean_csv(summary_rows, output_dir):
 
 def plot_mean_metrics(plt, summary_rows, output_dir):
     metrics = [
-        ("Mean Benchmark Time", "wall_time_sec", "seconds"),
+        ("Mean Total Time", "wall_time_sec", "seconds", "time_components"),
         ("Mean Optimization Time", "optimization_time_sec", "seconds"),
-        ("Mean Frontend Time", "frontend_time_sec", "seconds"),
+        ("Mean Trajectory Length", "trajectory_length", "meters"),
         ("Mean Flight Duration", "total_duration_sec", "seconds"),
         ("Mean Max Violation", "max_violation", "value"),
         ("Mean Jerk Energy", "jerk_energy", "integral"),
@@ -183,7 +183,9 @@ def plot_mean_metrics(plt, summary_rows, output_dir):
     fig, axes = plt.subplots(2, 3, figsize=(17, 9))
     fig.suptitle("GCOPTER Compare Mean Metrics", fontsize=18)
 
-    for ax, (title, key, ylabel) in zip(axes.flatten(), metrics):
+    for ax, metric in zip(axes.flatten(), metrics):
+        title, key, ylabel = metric[:3]
+        label_mode = metric[3] if len(metric) > 3 else "value"
         values = [to_float(row.get(key, "")) for row in summary_rows]
         x = np.arange(len(solvers))
         palette = {
@@ -198,9 +200,18 @@ def plot_mean_metrics(plt, summary_rows, output_dir):
         ax.set_ylabel(ylabel)
         ax.set_xticks(x)
         ax.set_xticklabels(solvers, rotation=20)
-        for idx, value in enumerate(values):
+        for idx, (row, value) in enumerate(zip(summary_rows, values)):
             if not math.isnan(value):
-                ax.text(idx, value, f"{value:.2f}", ha="center", va="bottom", fontsize=9)
+                if label_mode == "time_components":
+                    frontend = to_float(row.get("frontend_time_sec", ""))
+                    optimization = to_float(row.get("optimization_time_sec", ""))
+                    if not math.isnan(frontend) and not math.isnan(optimization):
+                        label = f"{frontend:.2f} + {optimization:.2f}"
+                    else:
+                        label = f"{value:.2f}"
+                else:
+                    label = f"{value:.2f}"
+                ax.text(idx, value, label, ha="center", va="bottom", fontsize=9)
 
     fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
     fig.savefig(output_dir / "metrics_mean.png", dpi=220)

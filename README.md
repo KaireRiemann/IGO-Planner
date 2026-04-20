@@ -10,7 +10,7 @@ Supported solvers in `gcopter/src/compare_planning.cpp`:
 
 * `LBFGS`: the original GCOPTER corridor optimizer.
 * `IGO`: IGO meta search followed by the same LBFGS refinement path.
-* `META`: a MetaPlanner-style waypoint-time optimizer over MINCO_S3 inner points and segment times.
+* `META`: a MetaPlanner-style derivative-free optimizer over a fixed low-dimensional MINCO_S3 problem. By default it optimizes 3 free intermediate waypoints and 4 direct segment times, then builds the final trajectory directly from those `P,T` variables.
 
 Run the comparison node with:
 
@@ -18,9 +18,12 @@ Run the comparison node with:
 
 The benchmark configuration is in `gcopter/config/compare_planning.yaml`. Important MetaOptimizer parameters include:
 
-* `MetaOptimizerEnergyWeight`: weight on the MINCO_S3 jerk energy from `MINCO_S3NU::getEnergy()`. Keep this value small because the analytic jerk energy scale is usually large.
-* `MetaOptimizerVelocityWeight`, `MetaOptimizerAccelerationWeight`, `MetaOptimizerBodyRateWeight`, `MetaOptimizerTiltWeight`, and `MetaOptimizerThrustWeight`: penalties for physical-limit violations.
-* `MetaOptimizerSampleDt`: sampling interval used only for violation and diagnostic evaluation.
+* `MetaOptimizerMidpoints`: fixed number of free intermediate waypoints. The MetaPlanner-style default is `3`, so the optimization dimension is `3 * 3 + 4 = 13`.
+* `MetaOptimizerTimeLowerBound` and `MetaOptimizerTimeUpperBound`: direct per-segment time bounds. The benchmark default `[0.10, 8.0]` is further tightened per candidate by segment length and target cruise speed.
+* `MetaOptimizerTimeWeight`, `MetaOptimizerCollisionWeight`, `MetaOptimizerVelocityWeight`, and `MetaOptimizerAccelerationWeight`: the simple sampled objective, matching the MetaPlanner form `time + collision_length + velocity_exceed + acceleration_exceed`. In the benchmark node, `collision_length` is evaluated directly against the voxel map.
+* `MetaOptimizerSimpleMaxVelocity`, `MetaOptimizerTargetVelocityRatio`, and `MetaOptimizerSimpleMaxAcceleration`: point-mass limits used by the META objective. Segment times are clamped around `segment_length / (TargetVelocityRatio * SimpleMaxVelocity)` while still penalizing sampled velocity and acceleration exceedance.
+* `MetaOptimizerSampleDt`: sampling interval for the simple META objective and violation accounting. The default is `0.10`, matching the MetaPlanner implementation.
+* `MetaOptimizerLengthWeight`, `MetaOptimizerEnergyWeight`, `MetaOptimizerWaypointSmoothWeight`, `MetaOptimizerBodyRateWeight`, `MetaOptimizerTiltWeight`, and `MetaOptimizerThrustWeight`: kept for compatibility with older configs, but the MetaPlanner-style simple objective leaves them at `0.0`.
 
 Benchmark outputs are written under `gcopter/script/compare_outputs/<timestamp>/`:
 
@@ -35,7 +38,7 @@ Timing columns use the following convention:
 * `frontend_time_sec`: path search plus corridor generation time.
 * `wall_time_sec`: benchmark runtime. For `LBFGS`, `IGO`, `IGO_XSPACE`, and `IGO_HEURISTIC`, this includes frontend time. For `META`, frontend time is recorded as zero because the meta-space optimizer is benchmarked as not requiring frontend path search.
 
-Trajectory diagnostics use the same MINCO_S3 representation as the solvers. In particular, `jerk_energy` is computed by rebuilding the solver-specific `MINCO_S3NU` from the final decision vector and calling `getEnergy()`, not by numerically integrating sampled jerk values.
+Trajectory diagnostics use the solver-specific MINCO_S3 representation. In particular, `jerk_energy` is computed by rebuilding the relevant `MINCO_S3NU` and calling `getEnergy()`, not by numerically integrating sampled jerk values. For `META`, diagnostics use the direct fixed-midpoint `P,T` trajectory instead of a lifted high-dimensional corridor parameterization.
 
 ## Updates
 

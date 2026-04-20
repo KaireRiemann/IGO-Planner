@@ -82,11 +82,15 @@ def compute_solver_means(rows):
         "objective",
         "wall_time_sec",
         "optimization_time_sec",
+        "frontend_time_sec",
+        "path_search_time_sec",
+        "corridor_generation_time_sec",
         "total_duration_sec",
         "trajectory_length",
         "collision_length",
         "max_collision_distance",
         "max_violation",
+        "max_acceleration_violation",
         "max_speed",
         "max_acceleration",
         "acceleration_energy",
@@ -103,19 +107,25 @@ def compute_solver_means(rows):
             "success_rate": clean_mean([to_float(item.get("success", "0")) for item in solver_rows]),
         }
         for metric in metrics:
-            source_key = "wall_time_sec" if metric == "optimization_time_sec" else metric
-            row[metric] = clean_mean([to_float(item.get(source_key, "")) for item in solver_rows])
+            row[metric] = clean_mean([to_float(item.get(metric, "")) for item in solver_rows])
         summary_rows.append(row)
 
     lbfgs_time = math.nan
+    lbfgs_opt_time = math.nan
     for row in summary_rows:
         if row["solver"] == "LBFGS":
-            lbfgs_time = row.get("optimization_time_sec", math.nan)
+            lbfgs_time = row.get("wall_time_sec", math.nan)
+            lbfgs_opt_time = row.get("optimization_time_sec", math.nan)
             break
     for row in summary_rows:
+        wall_time = row.get("wall_time_sec", math.nan)
         opt_time = row.get("optimization_time_sec", math.nan)
-        if not math.isnan(opt_time) and not math.isnan(lbfgs_time) and abs(lbfgs_time) > 1.0e-12:
-            row["optimization_time_ratio_vs_lbfgs"] = opt_time / lbfgs_time
+        if not math.isnan(wall_time) and not math.isnan(lbfgs_time) and abs(lbfgs_time) > 1.0e-12:
+            row["wall_time_ratio_vs_lbfgs"] = wall_time / lbfgs_time
+        else:
+            row["wall_time_ratio_vs_lbfgs"] = math.nan
+        if not math.isnan(opt_time) and not math.isnan(lbfgs_opt_time) and abs(lbfgs_opt_time) > 1.0e-12:
+            row["optimization_time_ratio_vs_lbfgs"] = opt_time / lbfgs_opt_time
         else:
             row["optimization_time_ratio_vs_lbfgs"] = math.nan
 
@@ -131,12 +141,17 @@ def write_solver_mean_csv(summary_rows, output_dir):
         "objective",
         "wall_time_sec",
         "optimization_time_sec",
+        "frontend_time_sec",
+        "path_search_time_sec",
+        "corridor_generation_time_sec",
+        "wall_time_ratio_vs_lbfgs",
         "optimization_time_ratio_vs_lbfgs",
         "total_duration_sec",
         "trajectory_length",
         "collision_length",
         "max_collision_distance",
         "max_violation",
+        "max_acceleration_violation",
         "max_speed",
         "max_acceleration",
         "acceleration_energy",
@@ -153,10 +168,10 @@ def write_solver_mean_csv(summary_rows, output_dir):
 
 def plot_mean_metrics(plt, summary_rows, output_dir):
     metrics = [
+        ("Mean Benchmark Time", "wall_time_sec", "seconds"),
         ("Mean Optimization Time", "optimization_time_sec", "seconds"),
+        ("Mean Frontend Time", "frontend_time_sec", "seconds"),
         ("Mean Flight Duration", "total_duration_sec", "seconds"),
-        ("Mean Trajectory Length", "trajectory_length", "meters"),
-        ("Mean Max Collision Distance", "max_collision_distance", "meters"),
         ("Mean Max Violation", "max_violation", "value"),
         ("Mean Jerk Energy", "jerk_energy", "integral"),
     ]

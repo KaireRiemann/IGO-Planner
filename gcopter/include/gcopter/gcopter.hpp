@@ -59,6 +59,7 @@ namespace gcopter
             double penalty_cost = 0.0;
             double max_corridor_violation = 0.0;
             double max_velocity_violation = 0.0;
+            double max_acceleration_violation = 0.0;
             double max_body_rate_violation = 0.0;
             double max_tilt_violation = 0.0;
             double max_thrust_violation = 0.0;
@@ -67,8 +68,8 @@ namespace gcopter
             inline double maxViolation() const
             {
                 return std::max(std::max(std::max(max_corridor_violation, max_velocity_violation),
-                                         std::max(max_body_rate_violation, max_tilt_violation)),
-                                max_thrust_violation);
+                                         std::max(max_acceleration_violation, max_body_rate_violation)),
+                                std::max(max_tilt_violation, max_thrust_violation));
             }
         };
 
@@ -110,11 +111,11 @@ namespace gcopter
             int refine_past = 3;
             double meta_optimizer_time_weight = 1.0;
             double meta_optimizer_length_weight = 2.0e-2;
-            double meta_optimizer_energy_weight = 3.0e+2;
+            double meta_optimizer_energy_weight = 1.0e-4;
             double meta_optimizer_collision_weight = 30.0;
             double meta_optimizer_velocity_weight = 20.0;
             double meta_optimizer_acceleration_weight = 25.0;
-            double meta_optimizer_body_rate_weight = 10.0;
+            double meta_optimizer_body_rate_weight = 30.0;
             double meta_optimizer_tilt_weight = 10.0;
             double meta_optimizer_thrust_weight = 10.0;
             double meta_optimizer_max_acceleration = 6.0;
@@ -1639,6 +1640,12 @@ namespace gcopter
                                                  TrajectoryViolationMetrics *metrics = nullptr,
                                                  Trajectory<5> *traj = nullptr);
 
+        inline double evaluateWaypointTimeFitness(const Eigen::Matrix3Xd &candidate_points,
+                                                  const Eigen::VectorXd &candidate_times,
+                                                  const IGOSolveOptions &options,
+                                                  TrajectoryViolationMetrics *metrics = nullptr,
+                                                  Trajectory<5> *traj = nullptr);
+
         inline LBFGSSolveOptions makeIGORefineLBFGSOptions(const IGOSolveOptions &options) const
         {
             LBFGSSolveOptions refine_options;
@@ -1807,6 +1814,36 @@ namespace gcopter
             }
 
             return cost;
+        }
+
+        inline bool buildJerkOpt(const Eigen::VectorXd &x,
+                                 minco::MINCO_S3NU &jerkOpt) const
+        {
+            if (x.size() != getDecisionDim() || pieceN <= 0)
+            {
+                return false;
+            }
+
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), temporalDim);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + temporalDim, spatialDim);
+
+            Eigen::VectorXd candidate_times;
+            Eigen::Matrix3Xd candidate_points;
+            forwardT(tau, candidate_times);
+            forwardP(xi, vPolyIdx, vPolytopes, candidate_points);
+
+            if (candidate_times.size() != pieceN ||
+                candidate_points.cols() != pieceN - 1 ||
+                !candidate_times.allFinite() ||
+                !candidate_points.allFinite() ||
+                (candidate_times.array() <= positiveEps()).any())
+            {
+                return false;
+            }
+
+            jerkOpt.setConditions(headPVA, tailPVA, pieceN);
+            jerkOpt.setParameters(candidate_points, candidate_times);
+            return true;
         }
 
         inline SolverResult solveLBFGS(const Eigen::VectorXd &initialX,

@@ -252,11 +252,11 @@ namespace
             nh_priv.param("IGORefineLBFGSPast", igoRefineLBFGSPast, 3);
             nh_priv.param("MetaOptimizerTimeWeight", metaOptimizerTimeWeight, 4.0);
             nh_priv.param("MetaOptimizerLengthWeight", metaOptimizerLengthWeight, 3.0e-2);
-            nh_priv.param("MetaOptimizerEnergyWeight", metaOptimizerEnergyWeight, 3.0e2);
+            nh_priv.param("MetaOptimizerEnergyWeight", metaOptimizerEnergyWeight, 1.0e-4);
             nh_priv.param("MetaOptimizerCollisionWeight", metaOptimizerCollisionWeight, 60.0);
             nh_priv.param("MetaOptimizerVelocityWeight", metaOptimizerVelocityWeight, 8.0);
             nh_priv.param("MetaOptimizerAccelerationWeight", metaOptimizerAccelerationWeight, 30.0);
-            nh_priv.param("MetaOptimizerBodyRateWeight", metaOptimizerBodyRateWeight, 10.0);
+            nh_priv.param("MetaOptimizerBodyRateWeight", metaOptimizerBodyRateWeight, 30.0);
             nh_priv.param("MetaOptimizerTiltWeight", metaOptimizerTiltWeight, 10.0);
             nh_priv.param("MetaOptimizerThrustWeight", metaOptimizerThrustWeight, 10.0);
             nh_priv.param("MetaOptimizerMaxAcceleration", metaOptimizerMaxAcceleration,
@@ -527,12 +527,46 @@ private:
         {
             recordFile << "request_id,timestamp,solver,seed,success,has_solution,converged,"
                           "hit_eval_budget,hit_time_budget,solver_status,iterations,eval_count,"
-                          "wall_time_sec,objective,total_duration_sec,trajectory_length,max_violation,"
-                          "max_corridor_violation,max_velocity_violation,max_body_rate_violation,"
+                          "wall_time_sec,optimization_time_sec,frontend_time_sec,"
+                          "path_search_time_sec,corridor_generation_time_sec,"
+                          "objective,total_duration_sec,trajectory_length,max_violation,"
+                          "max_corridor_violation,max_velocity_violation,max_acceleration_violation,"
+                          "max_body_rate_violation,"
                           "max_tilt_violation,max_thrust_violation,start_x,start_y,start_z,goal_x,"
                           "goal_y,goal_z,route_size,corridor_size,status\n";
             recordFile.flush();
         }
+    }
+
+    struct BenchmarkTiming
+    {
+        double wall_time = 0.0;
+        double optimization_time = 0.0;
+        double frontend_time = 0.0;
+        double path_search_time = 0.0;
+        double corridor_generation_time = 0.0;
+    };
+
+    static inline bool solverUsesFrontend(const std::string &solver_name)
+    {
+        return solver_name != "META";
+    }
+
+    static inline BenchmarkTiming makeBenchmarkTiming(const std::string &solver_name,
+                                                      const double optimization_time,
+                                                      const double path_search_time,
+                                                      const double corridor_generation_time)
+    {
+        BenchmarkTiming timing;
+        timing.optimization_time = optimization_time;
+        if (solverUsesFrontend(solver_name))
+        {
+            timing.path_search_time = path_search_time;
+            timing.corridor_generation_time = corridor_generation_time;
+            timing.frontend_time = path_search_time + corridor_generation_time;
+        }
+        timing.wall_time = timing.optimization_time + timing.frontend_time;
+        return timing;
     }
 
     struct TrajectoryDiagnostics
@@ -622,12 +656,13 @@ private:
         if (needHeader)
         {
             diagnosticsFile << "request_id,solver,seed,success,objective,wall_time_sec,"
-                               "optimization_time_sec,iterations,eval_count,total_duration_sec,trajectory_length,"
+                               "optimization_time_sec,frontend_time_sec,path_search_time_sec,"
+                               "corridor_generation_time_sec,iterations,eval_count,total_duration_sec,trajectory_length,"
                                "max_violation,collision_length,max_collision_distance,"
                                "collision_samples,max_speed,max_acceleration,"
                                "acceleration_energy,jerk_energy,"
                                "max_corridor_violation,max_velocity_violation,"
-                               "max_body_rate_violation,max_tilt_violation,"
+                               "max_acceleration_violation,max_body_rate_violation,max_tilt_violation,"
                                "max_thrust_violation,min_obstacle_distance,status\n";
             diagnosticsFile.flush();
         }
@@ -670,7 +705,22 @@ private:
         return max_radius * voxelMap.getScale();
     }
 
-    inline TrajectoryDiagnostics computeTrajectoryDiagnostics(const Trajectory<5> &trajectory) const
+    inline TrajectoryDiagnostics computeTrajectoryDiagnostics(const minco::MINCO_S3NU &jerk_opt) const
+    {
+        double jerk_energy = std::numeric_limits<double>::infinity();
+        jerk_opt.getEnergy(jerk_energy);
+        if (!std::isfinite(jerk_energy))
+        {
+            return TrajectoryDiagnostics();
+        }
+
+        Trajectory<5> trajectory;
+        jerk_opt.getTrajectory(trajectory);
+        return computeTrajectoryDiagnostics(trajectory, jerk_energy);
+    }
+
+    inline TrajectoryDiagnostics computeTrajectoryDiagnostics(const Trajectory<5> &trajectory,
+                                                              const double jerk_energy) const
     {
         TrajectoryDiagnostics diagnostics;
         if (trajectory.getPieceNum() <= 0)
@@ -680,6 +730,7 @@ private:
 
         diagnostics.valid = true;
         diagnostics.total_duration = trajectory.getTotalDuration();
+        diagnostics.jerk_energy = jerk_energy;
         const double sample_dt = std::max(0.02, config.diagnosticsSampleDt);
         const int sample_count =
             std::max(2, static_cast<int>(std::ceil(diagnostics.total_duration / sample_dt)) + 1);
@@ -698,7 +749,6 @@ private:
             const Eigen::Vector3d position = trajectory.getPos(t);
             const Eigen::Vector3d velocity = trajectory.getVel(t);
             const Eigen::Vector3d acceleration = trajectory.getAcc(t);
-            const Eigen::Vector3d jerk = trajectory.getJer(t);
 
             if (i > 0)
             {
@@ -732,8 +782,6 @@ private:
                 std::max(diagnostics.max_acceleration, acceleration.norm());
             diagnostics.acceleration_energy +=
                 acceleration.squaredNorm() * sample_dt;
-            diagnostics.jerk_energy +=
-                jerk.squaredNorm() * sample_dt;
             if (i > 0)
             {
                 diagnostics.samples.push_back(position);
@@ -751,7 +799,9 @@ private:
     inline void appendDiagnostics(const std::string &solver_name,
                                   const int seed,
                                   const gcopter::GCOPTER_PolytopeSFC::SolverResult &result,
-                                  const TrajectoryDiagnostics &diagnostics)
+                                  const TrajectoryDiagnostics &diagnostics,
+                                  const double path_search_time_sec,
+                                  const double corridor_generation_time_sec)
     {
         if (!diagnosticsFile.is_open())
         {
@@ -760,13 +810,21 @@ private:
 
         const bool success = result.has_solution &&
                              result.violations.maxViolation() <= config.igoFeasibilityTol;
+        const BenchmarkTiming timing =
+            makeBenchmarkTiming(solver_name,
+                                result.wall_time,
+                                path_search_time_sec,
+                                corridor_generation_time_sec);
         diagnosticsFile << requestId << ","
                         << solver_name << ","
                         << seed << ","
                         << (success ? 1 : 0) << ","
                         << result.objective << ","
-                        << result.wall_time << ","
-                        << result.wall_time << ","
+                        << timing.wall_time << ","
+                        << timing.optimization_time << ","
+                        << timing.frontend_time << ","
+                        << timing.path_search_time << ","
+                        << timing.corridor_generation_time << ","
                         << result.iterations << ","
                         << result.eval_count << ","
                         << diagnostics.total_duration << ","
@@ -781,6 +839,7 @@ private:
                         << diagnostics.jerk_energy << ","
                         << result.violations.max_corridor_violation << ","
                         << result.violations.max_velocity_violation << ","
+                        << result.violations.max_acceleration_violation << ","
                         << result.violations.max_body_rate_violation << ","
                         << result.violations.max_tilt_violation << ","
                         << result.violations.max_thrust_violation << ","
@@ -969,7 +1028,9 @@ private:
                              const int seed,
                              const gcopter::GCOPTER_PolytopeSFC::SolverResult &result,
                              const std::vector<Eigen::Vector3d> &route,
-                             const std::vector<Eigen::MatrixX4d> &hPolys)
+                             const std::vector<Eigen::MatrixX4d> &hPolys,
+                             const double path_search_time_sec,
+                             const double corridor_generation_time_sec)
     {
         if (!recordFile.is_open() || startGoal.size() != 2)
         {
@@ -978,6 +1039,11 @@ private:
 
         const bool success = result.has_solution &&
                              result.violations.maxViolation() <= config.igoFeasibilityTol;
+        const BenchmarkTiming timing =
+            makeBenchmarkTiming(solver_name,
+                                result.wall_time,
+                                path_search_time_sec,
+                                corridor_generation_time_sec);
         recordFile << requestId << ","
                    << std::fixed << std::setprecision(6) << ros::Time::now().toSec() << ","
                    << solver_name << ","
@@ -990,13 +1056,18 @@ private:
                    << result.solver_status << ","
                    << result.iterations << ","
                    << result.eval_count << ","
-                   << result.wall_time << ","
+                   << timing.wall_time << ","
+                   << timing.optimization_time << ","
+                   << timing.frontend_time << ","
+                   << timing.path_search_time << ","
+                   << timing.corridor_generation_time << ","
                    << result.objective << ","
                    << result.total_duration << ","
                    << result.trajectory_length << ","
                    << result.violations.maxViolation() << ","
                    << result.violations.max_corridor_violation << ","
                    << result.violations.max_velocity_violation << ","
+                   << result.violations.max_acceleration_violation << ","
                    << result.violations.max_body_rate_violation << ","
                    << result.violations.max_tilt_violation << ","
                    << result.violations.max_thrust_violation << ","
@@ -1020,12 +1091,17 @@ private:
         }
 
         std::vector<Eigen::Vector3d> route;
+        const auto path_search_start = std::chrono::steady_clock::now();
         sfc_gen::planPath<voxel_map::VoxelMap>(startGoal[0],
                                                startGoal[1],
                                                voxelMap.getOrigin(),
                                                voxelMap.getCorner(),
                                                &voxelMap, 0.01,
                                                route);
+        const double path_search_time_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          path_search_start)
+                .count();
 
         std::vector<Eigen::MatrixX4d> hPolys;
         if (route.size() <= 1)
@@ -1034,6 +1110,7 @@ private:
             return;
         }
 
+        const auto corridor_generation_start = std::chrono::steady_clock::now();
         std::vector<Eigen::Vector3d> pc;
         voxelMap.getSurf(pc);
         sfc_gen::convexCover(route,
@@ -1044,6 +1121,10 @@ private:
                              3.0,
                              hPolys);
         sfc_gen::shortCut(hPolys);
+        const double corridor_generation_time_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          corridor_generation_start)
+                .count();
         sharedVisualizer.visualizeRoute(route);
         lastRoute = route;
         if (hPolys.empty())
@@ -1090,24 +1171,24 @@ private:
         initialGuess = solver.getCommonInitialGuess();
         lbfgsResult =
             solver.solveLBFGSOriginal(initialGuess, config.lbfgsRelCostTol);
-        appendRecord("LBFGS", -1, lbfgsResult, route, hPolys);
+        appendRecord("LBFGS", -1, lbfgsResult, route, hPolys,
+                     path_search_time_sec, corridor_generation_time_sec);
 
         const gcopter::CorridorIGOTrajectoryPlanner igoPlanner;
         gcopter::GCOPTER_PolytopeSFC::SolverResult bestIGOResult;
-        Trajectory<5> bestIGOTrajectory;
         bool haveIGOResult = false;
         int bestIGOSeed = -1;
         for (const int seed : config.igoSeeds)
         {
             const gcopter::CorridorIGOTrajectoryPlanner::Result igoResult =
                 igoPlanner.solve(solver, initialGuess, makeIGOOptions(seed));
-            appendRecord("IGO", seed, igoResult.summary, route, hPolys);
+            appendRecord("IGO", seed, igoResult.summary, route, hPolys,
+                         path_search_time_sec, corridor_generation_time_sec);
 
             if (!haveIGOResult ||
                 isBetterResult(igoResult.summary, bestIGOResult, config.igoFeasibilityTol))
             {
                 bestIGOResult = igoResult.summary;
-                bestIGOTrajectory = igoResult.trajectory;
                 bestIGOSeed = seed;
                 haveIGOResult = true;
             }
@@ -1115,7 +1196,6 @@ private:
 
         const gcopter::MetaTrajectoryPlanner metaPlanner;
         gcopter::GCOPTER_PolytopeSFC::SolverResult bestMetaResult;
-        Trajectory<5> bestMetaTrajectory;
         bool haveMetaResult = false;
         int bestMetaSeed = -1;
         if (config.runMetaOptimizer)
@@ -1124,13 +1204,13 @@ private:
             {
                 const gcopter::MetaTrajectoryPlanner::Result metaResult =
                     metaPlanner.solve(solver, initialGuess, makeMetaOptions(seed));
-                appendRecord("META", seed, metaResult.summary, route, hPolys);
+                appendRecord("META", seed, metaResult.summary, route, hPolys,
+                             path_search_time_sec, corridor_generation_time_sec);
 
                 if (!haveMetaResult ||
                     isBetterResult(metaResult.summary, bestMetaResult, config.igoFeasibilityTol))
                 {
                     bestMetaResult = metaResult.summary;
-                    bestMetaTrajectory = metaResult.trajectory;
                     bestMetaSeed = seed;
                     haveMetaResult = true;
                 }
@@ -1146,7 +1226,8 @@ private:
             {
                 const gcopter::GCOPTER_PolytopeSFC::SolverResult xspaceResult =
                     solver.solveIGOXSpaceBenchmark(initialGuess, makeIGOOptions(seed));
-                appendRecord("IGO_XSPACE", seed, xspaceResult, route, hPolys);
+                appendRecord("IGO_XSPACE", seed, xspaceResult, route, hPolys,
+                             path_search_time_sec, corridor_generation_time_sec);
 
                 if (!haveXSpaceResult || isBetterResult(xspaceResult, bestXSpaceResult, config.igoFeasibilityTol))
                 {
@@ -1166,7 +1247,8 @@ private:
             {
                 const gcopter::GCOPTER_PolytopeSFC::SolverResult heuristicResult =
                     solver.solveIGOHeuristicPlanner(initialGuess, makeIGOOptions(seed));
-                appendRecord("IGO_HEURISTIC", seed, heuristicResult, route, hPolys);
+                appendRecord("IGO_HEURISTIC", seed, heuristicResult, route, hPolys,
+                             path_search_time_sec, corridor_generation_time_sec);
 
                 if (!haveHeuristicResult || isBetterResult(heuristicResult, bestHeuristicResult, config.igoFeasibilityTol))
                 {
@@ -1180,37 +1262,61 @@ private:
         lbfgsTraj.clear();
         igoTraj.clear();
         metaTraj.clear();
+        minco::MINCO_S3NU lbfgsJerkOpt;
+        minco::MINCO_S3NU igoJerkOpt;
+        minco::MINCO_S3NU metaJerkOpt;
+        bool haveLBFGSJerkOpt = false;
+        bool haveIGOJerkOpt = false;
+        bool haveMetaJerkOpt = false;
         if (lbfgsResult.has_solution)
         {
-            solver.evaluateObjectiveOnly(lbfgsResult.best_x, nullptr, &lbfgsTraj);
-            lbfgsVisualizer.visualizeTrajectory(lbfgsTraj);
+            haveLBFGSJerkOpt = solver.buildJerkOpt(lbfgsResult.best_x, lbfgsJerkOpt);
+            if (haveLBFGSJerkOpt)
+            {
+                lbfgsJerkOpt.getTrajectory(lbfgsTraj);
+                lbfgsVisualizer.visualizeTrajectory(lbfgsTraj);
+            }
         }
 
         if (haveIGOResult && bestIGOResult.has_solution)
         {
-            igoTraj = bestIGOTrajectory;
-            igoVisualizer.visualizeTrajectory(igoTraj);
+            haveIGOJerkOpt = solver.buildJerkOpt(bestIGOResult.best_x, igoJerkOpt);
+            if (haveIGOJerkOpt)
+            {
+                igoJerkOpt.getTrajectory(igoTraj);
+                igoVisualizer.visualizeTrajectory(igoTraj);
+            }
         }
         if (haveMetaResult && bestMetaResult.has_solution)
         {
-            metaTraj = bestMetaTrajectory;
-            metaVisualizer.visualizeTrajectory(metaTraj);
+            haveMetaJerkOpt = solver.buildJerkOpt(bestMetaResult.best_x, metaJerkOpt);
+            if (haveMetaJerkOpt)
+            {
+                metaJerkOpt.getTrajectory(metaTraj);
+                metaVisualizer.visualizeTrajectory(metaTraj);
+            }
         }
 
         const TrajectoryDiagnostics lbfgsDiagnostics =
-            computeTrajectoryDiagnostics(lbfgsTraj);
+            haveLBFGSJerkOpt ? computeTrajectoryDiagnostics(lbfgsJerkOpt)
+                             : TrajectoryDiagnostics();
         const TrajectoryDiagnostics igoDiagnostics =
-            computeTrajectoryDiagnostics(igoTraj);
+            haveIGOJerkOpt ? computeTrajectoryDiagnostics(igoJerkOpt)
+                           : TrajectoryDiagnostics();
         const TrajectoryDiagnostics metaDiagnostics =
-            computeTrajectoryDiagnostics(metaTraj);
-        appendDiagnostics("LBFGS", -1, lbfgsResult, lbfgsDiagnostics);
+            haveMetaJerkOpt ? computeTrajectoryDiagnostics(metaJerkOpt)
+                            : TrajectoryDiagnostics();
+        appendDiagnostics("LBFGS", -1, lbfgsResult, lbfgsDiagnostics,
+                          path_search_time_sec, corridor_generation_time_sec);
         if (haveIGOResult)
         {
-            appendDiagnostics("IGO", bestIGOSeed, bestIGOResult, igoDiagnostics);
+            appendDiagnostics("IGO", bestIGOSeed, bestIGOResult, igoDiagnostics,
+                              path_search_time_sec, corridor_generation_time_sec);
         }
         if (haveMetaResult)
         {
-            appendDiagnostics("META", bestMetaSeed, bestMetaResult, metaDiagnostics);
+            appendDiagnostics("META", bestMetaSeed, bestMetaResult, metaDiagnostics,
+                              path_search_time_sec, corridor_generation_time_sec);
         }
         writeTrajectorySamples(route, lbfgsDiagnostics, igoDiagnostics, metaDiagnostics);
         refreshPlotArtifacts();
@@ -1221,6 +1327,7 @@ private:
         const std::string metrics_plot_path = getMetricsPlotPath();
         const std::string metrics_mean_csv_path = getMetricsMeanCsvPath();
         const std::string trajectory_plot_path = getTrajectoryPlotPath();
+        const double frontend_time_sec = path_search_time_sec + corridor_generation_time_sec;
         info_stream << "Request " << requestId
                     << " LBFGS obj=" << lbfgsResult.objective
                     << " success=" << (lbfgsResult.has_solution &&
@@ -1235,6 +1342,12 @@ private:
                                        bestMetaResult.violations.maxViolation() <= config.igoFeasibilityTol)
                     << " | opt_time LBFGS=" << lbfgsResult.wall_time
                     << " IGO=" << (haveIGOResult ? bestIGOResult.wall_time : std::numeric_limits<double>::infinity())
+                    << " META=" << (haveMetaResult ? bestMetaResult.wall_time : std::numeric_limits<double>::infinity())
+                    << " | frontend path=" << path_search_time_sec
+                    << " corridor=" << corridor_generation_time_sec
+                    << " total=" << frontend_time_sec
+                    << " | benchmark_time LBFGS=" << (lbfgsResult.wall_time + frontend_time_sec)
+                    << " IGO=" << (haveIGOResult ? bestIGOResult.wall_time + frontend_time_sec : std::numeric_limits<double>::infinity())
                     << " META=" << (haveMetaResult ? bestMetaResult.wall_time : std::numeric_limits<double>::infinity())
                     << " | LBFGS traj_len=" << lbfgsDiagnostics.trajectory_length
                     << " coll_len=" << lbfgsDiagnostics.collision_length

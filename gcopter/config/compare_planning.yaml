@@ -57,11 +57,11 @@ IGORefineLBFGSPast: 3
 
 MetaOptimizerTimeWeight: 4.0
 MetaOptimizerLengthWeight: 3.0e-2
-MetaOptimizerEnergyWeight: 3.0e+2
+MetaOptimizerEnergyWeight: 1.0e-2
 MetaOptimizerCollisionWeight: 60.0
 MetaOptimizerVelocityWeight: 8.0
 MetaOptimizerAccelerationWeight: 30.0
-MetaOptimizerBodyRateWeight: 10.0
+MetaOptimizerBodyRateWeight: 30.0
 MetaOptimizerTiltWeight: 10.0
 MetaOptimizerThrustWeight: 10.0
 MetaOptimizerMaxAcceleration: 5.5
@@ -71,7 +71,7 @@ MetaOptimizerInitialTimeScale: 1.18
 MetaOptimizerTotalSlackMinScale: 0.04
 MetaOptimizerTotalSlackMaxScale: 0.65
 MetaOptimizerPopulation: 40
-MetaOptimizerMaxIterations: 120
-MetaOptimizerMaxEvaluations: 760
-MetaOptimizerMaxWallTime: 0.25
+MetaOptimizerMaxIterations: 80
+MetaOptimizerMaxEvaluations: 3200
+MetaOptimizerMaxWallTime: 0.35
 MetaOptimizerSeeds: [0, 1]

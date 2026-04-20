@@ -2,6 +2,41 @@
 
 __GCOPTER__ is an efficient and versatile multicopter trajectory optimizer built upon a novel sparse trajectory representation named [__MINCO__](https://arxiv.org/pdf/2103.00190.pdf). __User-defined state-input constraints__ for dynamics involving [__nonlinear drag effects__](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/misc/flatness.pdf) are supported.
 
+## IGO-Planner Additions
+
+This fork adds a ROS benchmark node for comparing gradient-based GCOPTER optimization with derivative-free meta-space optimizers.
+
+Supported solvers in `gcopter/src/compare_planning.cpp`:
+
+* `LBFGS`: the original GCOPTER corridor optimizer.
+* `IGO`: IGO meta search followed by the same LBFGS refinement path.
+* `META`: a MetaPlanner-style waypoint-time optimizer over MINCO_S3 inner points and segment times.
+
+Run the comparison node with:
+
+    roslaunch gcopter compare_planning.launch
+
+The benchmark configuration is in `gcopter/config/compare_planning.yaml`. Important MetaOptimizer parameters include:
+
+* `MetaOptimizerEnergyWeight`: weight on the MINCO_S3 jerk energy from `MINCO_S3NU::getEnergy()`. Keep this value small because the analytic jerk energy scale is usually large.
+* `MetaOptimizerVelocityWeight`, `MetaOptimizerAccelerationWeight`, `MetaOptimizerBodyRateWeight`, `MetaOptimizerTiltWeight`, and `MetaOptimizerThrustWeight`: penalties for physical-limit violations.
+* `MetaOptimizerSampleDt`: sampling interval used only for violation and diagnostic evaluation.
+
+Benchmark outputs are written under `gcopter/script/compare_outputs/<timestamp>/`:
+
+* `compare_records.csv`: per-seed solver summaries.
+* `trajectory_metrics.csv`: diagnostics for the best trajectory from each solver.
+* `solver_mean_metrics.csv`: mean metrics used for plots.
+* `request_<id>_trajectory.csv` and `request_<id>_trajectory.png`: sampled trajectory shapes.
+
+Timing columns use the following convention:
+
+* `optimization_time_sec`: optimizer-only runtime.
+* `frontend_time_sec`: path search plus corridor generation time.
+* `wall_time_sec`: benchmark runtime. For `LBFGS`, `IGO`, `IGO_XSPACE`, and `IGO_HEURISTIC`, this includes frontend time. For `META`, frontend time is recorded as zero because the meta-space optimizer is benchmarked as not requiring frontend path search.
+
+Trajectory diagnostics use the same MINCO_S3 representation as the solvers. In particular, `jerk_energy` is computed by rebuilding the solver-specific `MINCO_S3NU` from the final decision vector and calling `getEnergy()`, not by numerically integrating sampled jerk values.
+
 ## Updates
 
 * **July 20, 2022** - Released [__my thesis in chinese__](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/Thesis%20-%20ZhepeiWang%20-%20Chinese%20-%20A%20Geometrical%20Approach%20to%20Multicopter%20Motion%20Planning.pdf) with detailed and up-to-dated methodology about corridor generation, multicopter dynamics, trajectory planning, and so on.

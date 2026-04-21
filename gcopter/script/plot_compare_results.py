@@ -60,7 +60,7 @@ def load_csv_rows(csv_path):
 
 
 def solver_order(solvers):
-    preferred = ["LBFGS", "IGO", "META", "IGO_XSPACE", "IGO_HEURISTIC"]
+    preferred = ["LBFGS", "IGO", "META", "META_PT", "IGO_XSPACE", "IGO_HEURISTIC"]
     ordered = [solver for solver in preferred if solver in solvers]
     extras = sorted(solver for solver in solvers if solver not in preferred)
     return ordered + extras
@@ -71,6 +71,28 @@ def clean_mean(values):
     if not cleaned:
         return math.nan
     return float(np.mean(np.asarray(cleaned, dtype=float)))
+
+
+def format_bar_value(value, ylabel):
+    if math.isnan(value):
+        return ""
+    if ylabel == "seconds":
+        abs_value = abs(value)
+        if abs_value < 0.1:
+            return f"{value * 1000.0:.1f} ms"
+        return f"{value:.2f} s"
+    abs_value = abs(value)
+    if 0.0 < abs_value < 0.01:
+        return f"{value:.3g}"
+    return f"{value:.2f}"
+
+
+def format_time_component(value):
+    if math.isnan(value):
+        return "nan"
+    if abs(value) < 0.1:
+        return f"{value * 1000.0:.1f}ms"
+    return f"{value:.2f}s"
 
 
 def compute_solver_means(rows):
@@ -192,6 +214,7 @@ def plot_mean_metrics(plt, summary_rows, output_dir):
             "LBFGS": "#0073F0",
             "IGO": "#FF7A00",
             "META": "#4C9F70",
+            "META_PT": "#00AFC8",
             "IGO_XSPACE": "#9467BD",
             "IGO_HEURISTIC": "#8C564B",
         }
@@ -206,11 +229,14 @@ def plot_mean_metrics(plt, summary_rows, output_dir):
                     frontend = to_float(row.get("frontend_time_sec", ""))
                     optimization = to_float(row.get("optimization_time_sec", ""))
                     if not math.isnan(frontend) and not math.isnan(optimization):
-                        label = f"{frontend:.2f} + {optimization:.2f}"
+                        label = (
+                            f"{format_time_component(frontend)} + "
+                            f"{format_time_component(optimization)}"
+                        )
                     else:
-                        label = f"{value:.2f}"
+                        label = format_bar_value(value, ylabel)
                 else:
-                    label = f"{value:.2f}"
+                    label = format_bar_value(value, ylabel)
                 ax.text(idx, value, label, ha="center", va="bottom", fontsize=9)
 
     fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
@@ -224,6 +250,7 @@ def trajectory_colors():
         "LBFGS": ("#0073F0", "-", 2.6),
         "IGO": ("#FF7A00", "-", 2.6),
         "META": ("#4C9F70", "-", 2.6),
+        "META_PT": ("#00AFC8", "-", 2.6),
     }
 
 

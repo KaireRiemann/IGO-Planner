@@ -30,6 +30,8 @@ planner:
 
 benchmark:
   feasibility_tolerance: 1.0e-4
+  run_lbfgs: true
+  run_igo: true
 
   lbfgs:
     rel_cost_tol: 1.0e-5
@@ -49,3 +51,36 @@ benchmark:
     eta_sigma: 0.20
     elite_ratio: 0.35
     seeds: [0, 1, 2, 3, 4]
+
+  meta:
+    enabled: true
+    run_pt: true
+    population: 50
+    max_iterations: 80
+    max_evaluations: 500
+    max_wall_time: 0.0
+    min_sigma: 1.0e-3
+    eta_mean: 0.45
+    eta_sigma: 0.20
+    elite_ratio: 0.35
+    time_weight: 4.0
+    length_weight: 0.0
+    energy_weight: 0.0
+    waypoint_smooth_weight: 0.0
+    collision_weight: 30.0
+    velocity_weight: 20.0
+    acceleration_weight: 25.0
+    sample_dt: 0.10
+    midpoints: 4
+    time_lower_bound: 0.10
+    time_upper_bound: 8.0
+    simple_max_velocity: 4.0
+    simple_max_acceleration: 15.0
+    target_velocity_ratio: 0.90
+    local_box_radius: 2.0
+    use_collision_length_cost: true
+    time_floor_scale: 1.10
+    initial_time_scale: 1.18
+    total_slack_min_scale: 0.04
+    total_slack_max_scale: 0.65
+    seeds: [0, 1]

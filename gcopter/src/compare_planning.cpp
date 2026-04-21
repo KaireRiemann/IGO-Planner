@@ -168,6 +168,8 @@ namespace
         double metaOptimizerSimpleMaxVelocity;
         double metaOptimizerSimpleMaxAcceleration;
         double metaOptimizerTargetVelocityRatio;
+        double metaOptimizerLocalBoxRadius;
+        bool metaOptimizerUseCollisionLengthCost;
         double metaOptimizerTimeFloorScale;
         double metaOptimizerInitialTimeScale;
         double metaOptimizerTotalSlackMinScale;
@@ -269,12 +271,14 @@ namespace
             nh_priv.param("MetaOptimizerThrustWeight", metaOptimizerThrustWeight, 0.0);
             nh_priv.param("MetaOptimizerMaxAcceleration", metaOptimizerMaxAcceleration, 15.0);
             nh_priv.param("MetaOptimizerSampleDt", metaOptimizerSampleDt, 0.10);
-            nh_priv.param("MetaOptimizerMidpoints", metaOptimizerMidpoints, 3);
+            nh_priv.param("MetaOptimizerMidpoints", metaOptimizerMidpoints, 4);
             nh_priv.param("MetaOptimizerTimeLowerBound", metaOptimizerTimeLowerBound, 0.10);
             nh_priv.param("MetaOptimizerTimeUpperBound", metaOptimizerTimeUpperBound, 8.0);
             nh_priv.param("MetaOptimizerSimpleMaxVelocity", metaOptimizerSimpleMaxVelocity, maxVelMag);
             nh_priv.param("MetaOptimizerSimpleMaxAcceleration", metaOptimizerSimpleMaxAcceleration, 15.0);
             nh_priv.param("MetaOptimizerTargetVelocityRatio", metaOptimizerTargetVelocityRatio, 0.90);
+            nh_priv.param("MetaOptimizerLocalBoxRadius", metaOptimizerLocalBoxRadius, 2.0);
+            nh_priv.param("MetaOptimizerUseCollisionLengthCost", metaOptimizerUseCollisionLengthCost, true);
             nh_priv.param("MetaOptimizerTimeFloorScale", metaOptimizerTimeFloorScale, 1.10);
             nh_priv.param("MetaOptimizerInitialTimeScale", metaOptimizerInitialTimeScale, 1.18);
             nh_priv.param("MetaOptimizerTotalSlackMinScale", metaOptimizerTotalSlackMinScale, 0.04);
@@ -413,12 +417,14 @@ private:
     Visualizer lbfgsVisualizer;
     Visualizer igoVisualizer;
     Visualizer metaVisualizer;
+    Visualizer metaPtVisualizer;
 
     std::vector<Eigen::Vector3d> startGoal;
     std::vector<Eigen::Vector3d> lastRoute;
     Trajectory<5> lbfgsTraj;
     Trajectory<5> igoTraj;
     Trajectory<5> metaTraj;
+    Trajectory<5> metaPtTraj;
     double trajStamp;
     int requestId;
 
@@ -437,6 +443,7 @@ public:
           lbfgsVisualizer(nh_, makeLBFGSStyle()),
           igoVisualizer(nh_, makeIGOStyle()),
           metaVisualizer(nh_, makeMetaStyle()),
+          metaPtVisualizer(nh_, makeMetaPTStyle()),
           trajStamp(-1.0),
           requestId(0)
     {
@@ -489,6 +496,18 @@ private:
         style.trajectoryColor = {0.0, 0.62, 0.28, 1.0};
         style.waypointsColor = {0.0, 0.62, 0.28, 1.0};
         style.sphereColor = {0.0, 0.62, 0.28, 1.0};
+        style.trajectoryWidth = 0.22;
+        style.waypointScale = 0.22;
+        return style;
+    }
+
+    static Visualizer::Style makeMetaPTStyle()
+    {
+        Visualizer::Style style;
+        style.topicPrefix = "/visualizer_meta_pt";
+        style.trajectoryColor = {0.0, 0.72, 0.85, 1.0};
+        style.waypointsColor = {0.0, 0.72, 0.85, 1.0};
+        style.sphereColor = {0.0, 0.72, 0.85, 1.0};
         style.trajectoryWidth = 0.22;
         style.waypointScale = 0.22;
         return style;
@@ -562,7 +581,7 @@ private:
 
     static inline bool solverUsesFrontend(const std::string &solver_name)
     {
-        return solver_name != "META";
+        return solver_name != "META" && solver_name != "META_PT";
     }
 
     static inline BenchmarkTiming makeBenchmarkTiming(const std::string &solver_name,
@@ -864,7 +883,8 @@ private:
     inline void writeTrajectorySamples(const std::vector<Eigen::Vector3d> &route,
                                        const TrajectoryDiagnostics &lbfgsDiagnostics,
                                        const TrajectoryDiagnostics &igoDiagnostics,
-                                       const TrajectoryDiagnostics &metaDiagnostics) const
+                                       const TrajectoryDiagnostics &metaDiagnostics,
+                                       const TrajectoryDiagnostics &metaPTDiagnostics) const
     {
         const std::string path = getTrajectoryDataPath();
         if (path.empty())
@@ -905,6 +925,7 @@ private:
         writeSeries("LBFGS", lbfgsDiagnostics.samples);
         writeSeries("IGO", igoDiagnostics.samples);
         writeSeries("META", metaDiagnostics.samples);
+        writeSeries("META_PT", metaPTDiagnostics.samples);
     }
 
     inline void refreshPlotArtifacts() const
@@ -943,6 +964,7 @@ private:
         lbfgsVisualizer.clear();
         igoVisualizer.clear();
         metaVisualizer.clear();
+        metaPtVisualizer.clear();
     }
 
     inline void mapCallBack(const sensor_msgs::PointCloud2::ConstPtr &msg)
@@ -1026,6 +1048,8 @@ private:
         options.meta_optimizer_simple_max_velocity = config.metaOptimizerSimpleMaxVelocity;
         options.meta_optimizer_simple_max_acceleration = config.metaOptimizerSimpleMaxAcceleration;
         options.meta_optimizer_target_velocity_ratio = config.metaOptimizerTargetVelocityRatio;
+        options.meta_optimizer_local_box_radius = config.metaOptimizerLocalBoxRadius;
+        options.meta_optimizer_use_collision_length_cost = config.metaOptimizerUseCollisionLengthCost;
         if (config.mapBound.size() == 6)
         {
             options.meta_optimizer_has_workspace_bounds = true;
@@ -1235,6 +1259,9 @@ private:
         gcopter::GCOPTER_PolytopeSFC::SolverResult bestMetaResult;
         bool haveMetaResult = false;
         int bestMetaSeed = -1;
+        gcopter::GCOPTER_PolytopeSFC::SolverResult bestMetaPTResult;
+        bool haveMetaPTResult = false;
+        int bestMetaPTSeed = -1;
         if (config.runMetaOptimizer)
         {
             for (const int seed : config.metaOptimizerSeeds)
@@ -1250,6 +1277,22 @@ private:
                     bestMetaResult = metaResult.summary;
                     bestMetaSeed = seed;
                     haveMetaResult = true;
+                }
+
+                gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions metaPTOptions =
+                    makeMetaOptions(seed);
+                metaPTOptions.meta_optimizer_use_time_profile = false;
+                const gcopter::MetaTrajectoryPlanner::Result metaPTResult =
+                    metaPlanner.solve(solver, initialGuess, metaPTOptions);
+                appendRecord("META_PT", seed, metaPTResult.summary, route, hPolys,
+                             path_search_time_sec, corridor_generation_time_sec);
+
+                if (!haveMetaPTResult ||
+                    isBetterResult(metaPTResult.summary, bestMetaPTResult, config.igoFeasibilityTol))
+                {
+                    bestMetaPTResult = metaPTResult.summary;
+                    bestMetaPTSeed = seed;
+                    haveMetaPTResult = true;
                 }
             }
         }
@@ -1299,12 +1342,15 @@ private:
         lbfgsTraj.clear();
         igoTraj.clear();
         metaTraj.clear();
+        metaPtTraj.clear();
         minco::MINCO_S3NU lbfgsJerkOpt;
         minco::MINCO_S3NU igoJerkOpt;
         minco::MINCO_S3NU metaJerkOpt;
+        minco::MINCO_S3NU metaPTJerkOpt;
         bool haveLBFGSJerkOpt = false;
         bool haveIGOJerkOpt = false;
         bool haveMetaJerkOpt = false;
+        bool haveMetaPTJerkOpt = false;
         if (lbfgsResult.has_solution)
         {
             haveLBFGSJerkOpt = solver.buildJerkOpt(lbfgsResult.best_x, lbfgsJerkOpt);
@@ -1339,6 +1385,21 @@ private:
                 metaVisualizer.visualizeTrajectory(metaTraj);
             }
         }
+        if (haveMetaPTResult && bestMetaPTResult.has_solution)
+        {
+            haveMetaPTJerkOpt =
+                solver.buildMetaDirectJerkOpt(bestMetaPTResult, metaPTJerkOpt);
+            if (!haveMetaPTJerkOpt)
+            {
+                haveMetaPTJerkOpt =
+                    solver.buildJerkOpt(bestMetaPTResult.best_x, metaPTJerkOpt);
+            }
+            if (haveMetaPTJerkOpt)
+            {
+                metaPTJerkOpt.getTrajectory(metaPtTraj);
+                metaPtVisualizer.visualizeTrajectory(metaPtTraj);
+            }
+        }
 
         const TrajectoryDiagnostics lbfgsDiagnostics =
             haveLBFGSJerkOpt ? computeTrajectoryDiagnostics(lbfgsJerkOpt)
@@ -1349,6 +1410,9 @@ private:
         const TrajectoryDiagnostics metaDiagnostics =
             haveMetaJerkOpt ? computeTrajectoryDiagnostics(metaJerkOpt)
                             : TrajectoryDiagnostics();
+        const TrajectoryDiagnostics metaPTDiagnostics =
+            haveMetaPTJerkOpt ? computeTrajectoryDiagnostics(metaPTJerkOpt)
+                              : TrajectoryDiagnostics();
         appendDiagnostics("LBFGS", -1, lbfgsResult, lbfgsDiagnostics,
                           path_search_time_sec, corridor_generation_time_sec);
         if (haveIGOResult)
@@ -1361,7 +1425,13 @@ private:
             appendDiagnostics("META", bestMetaSeed, bestMetaResult, metaDiagnostics,
                               path_search_time_sec, corridor_generation_time_sec);
         }
-        writeTrajectorySamples(route, lbfgsDiagnostics, igoDiagnostics, metaDiagnostics);
+        if (haveMetaPTResult)
+        {
+            appendDiagnostics("META_PT", bestMetaPTSeed, bestMetaPTResult, metaPTDiagnostics,
+                              path_search_time_sec, corridor_generation_time_sec);
+        }
+        writeTrajectorySamples(route, lbfgsDiagnostics, igoDiagnostics,
+                               metaDiagnostics, metaPTDiagnostics);
         refreshPlotArtifacts();
 
         trajStamp = ros::Time::now().toSec();
@@ -1383,15 +1453,21 @@ private:
                     << ") obj=" << (haveMetaResult ? bestMetaResult.objective : std::numeric_limits<double>::infinity())
                     << " success=" << (haveMetaResult && bestMetaResult.has_solution &&
                                        bestMetaResult.violations.maxViolation() <= config.igoFeasibilityTol)
+                    << " | META_PT(best seed=" << bestMetaPTSeed
+                    << ") obj=" << (haveMetaPTResult ? bestMetaPTResult.objective : std::numeric_limits<double>::infinity())
+                    << " success=" << (haveMetaPTResult && bestMetaPTResult.has_solution &&
+                                       bestMetaPTResult.violations.maxViolation() <= config.igoFeasibilityTol)
                     << " | opt_time LBFGS=" << lbfgsResult.wall_time
                     << " IGO=" << (haveIGOResult ? bestIGOResult.wall_time : std::numeric_limits<double>::infinity())
                     << " META=" << (haveMetaResult ? bestMetaResult.wall_time : std::numeric_limits<double>::infinity())
+                    << " META_PT=" << (haveMetaPTResult ? bestMetaPTResult.wall_time : std::numeric_limits<double>::infinity())
                     << " | frontend path=" << path_search_time_sec
                     << " corridor=" << corridor_generation_time_sec
                     << " total=" << frontend_time_sec
                     << " | benchmark_time LBFGS=" << (lbfgsResult.wall_time + frontend_time_sec)
                     << " IGO=" << (haveIGOResult ? bestIGOResult.wall_time + frontend_time_sec : std::numeric_limits<double>::infinity())
                     << " META=" << (haveMetaResult ? bestMetaResult.wall_time : std::numeric_limits<double>::infinity())
+                    << " META_PT=" << (haveMetaPTResult ? bestMetaPTResult.wall_time : std::numeric_limits<double>::infinity())
                     << " | LBFGS traj_len=" << lbfgsDiagnostics.trajectory_length
                     << " coll_len=" << lbfgsDiagnostics.collision_length
                     << " max_coll_dist=" << lbfgsDiagnostics.max_collision_distance
@@ -1406,7 +1482,12 @@ private:
                     << " coll_len=" << metaDiagnostics.collision_length
                     << " max_coll_dist=" << metaDiagnostics.max_collision_distance
                     << " jerk_energy=" << metaDiagnostics.jerk_energy
-                    << " min_obs_dist=" << metaDiagnostics.min_obstacle_distance;
+                    << " min_obs_dist=" << metaDiagnostics.min_obstacle_distance
+                    << " | META_PT traj_len=" << metaPTDiagnostics.trajectory_length
+                    << " coll_len=" << metaPTDiagnostics.collision_length
+                    << " max_coll_dist=" << metaPTDiagnostics.max_collision_distance
+                    << " jerk_energy=" << metaPTDiagnostics.jerk_energy
+                    << " min_obs_dist=" << metaPTDiagnostics.min_obstacle_distance;
         if (config.runIGOXSpaceBenchmark)
         {
             info_stream << " | IGO_XSPACE(best seed=" << bestXSpaceSeed
@@ -1453,6 +1534,7 @@ public:
             lbfgsTraj.clear();
             igoTraj.clear();
             metaTraj.clear();
+            metaPtTraj.clear();
             clearVisualizers();
         }
 
@@ -1494,6 +1576,10 @@ public:
         if (metaTraj.getPieceNum() > 0 && delta >= 0.0 && delta < metaTraj.getTotalDuration())
         {
             metaVisualizer.visualizeSphere(metaTraj.getPos(delta), 0.50);
+        }
+        if (metaPtTraj.getPieceNum() > 0 && delta >= 0.0 && delta < metaPtTraj.getTotalDuration())
+        {
+            metaPtVisualizer.visualizeSphere(metaPtTraj.getPos(delta), 0.50);
         }
     }
 };

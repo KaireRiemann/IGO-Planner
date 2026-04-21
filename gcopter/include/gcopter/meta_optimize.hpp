@@ -2,6 +2,7 @@
 #define GCOPTER_META_OPTIMIZE_HPP
 
 #include "gcopter/gcopter.hpp"
+#include "gcopter/minco_blackbox_optimizer.hpp"
 #include "gcopter/trajectory.hpp"
 
 namespace gcopter
@@ -320,8 +321,15 @@ namespace gcopter
         SolverResult result;
         const int point_count = std::max(0, options.meta_optimizer_midpoints);
         const int direct_piece_num = point_count + 1;
-        const int time_offset = 3 * point_count;
-        const int direct_dim = time_offset + direct_piece_num;
+        const bool use_time_profile = options.meta_optimizer_use_time_profile;
+        const int time_param_offset = 3 * point_count;
+        const int gamma_offset = time_param_offset + direct_piece_num;
+        const int direct_dim =
+            use_time_profile ? (gamma_offset + 1)
+                             : (time_param_offset + direct_piece_num);
+        const std::string direct_mode_name =
+            use_time_profile ? "fixed P,beta,gamma"
+                             : "fixed P,T";
         if (direct_piece_num <= 0 || pieceN <= 0 || direct_dim <= 0)
         {
             result.best_x =
@@ -337,7 +345,8 @@ namespace gcopter
                 result.trajectory_length =
                     approximateTrajectoryLength(local_traj, std::max(8, 4 * integralRes));
             }
-            result.status = "MetaPlanner-style fixed P,T IGO optimizer (empty decision space)";
+            result.status = "MetaPlanner-style " + direct_mode_name +
+                            " IGO optimizer (empty decision space)";
             return result;
         }
 
@@ -355,12 +364,26 @@ namespace gcopter
             std::min(physical_vel_max, configured_vel_max);
         const double simple_acc_max =
             std::max(eps, options.meta_optimizer_simple_max_acceleration);
+        const double time_floor_scale =
+            std::max(0.0, options.meta_time_floor_scale);
         const double target_velocity_ratio =
-            std::max(0.20, std::min(1.0, options.meta_optimizer_target_velocity_ratio));
+            std::max(0.20,
+                     std::min(1.0, options.meta_optimizer_target_velocity_ratio));
         const double target_vel =
             std::max(eps, target_velocity_ratio * simple_vel_max);
         const double time_upper_scale =
-            std::max(1.05, 1.0 + std::max(0.0, options.meta_total_slack_max_scale));
+            std::max(1.05,
+                     1.0 + std::max(0.0, options.meta_total_slack_max_scale));
+        const double slack_min_scale =
+            std::max(0.0, options.meta_total_slack_min_scale);
+        const double slack_max_scale =
+            std::max(slack_min_scale, options.meta_total_slack_max_scale);
+        const double beta_bound =
+            std::max(0.1, options.meta_time_logit_bound);
+        const double gamma_bound =
+            std::max(0.1, options.meta_gamma_box_radius);
+        const double local_box_radius =
+            std::max(0.0, options.meta_optimizer_local_box_radius);
 
         Eigen::Vector3d workspace_min =
             headPVA.col(0).cwiseMin(tailPVA.col(0));
@@ -413,6 +436,18 @@ namespace gcopter
             return points.col(idx - 1);
         };
 
+        auto sigmoid =
+            [](const double x) -> double
+        {
+            if (x >= 0.0)
+            {
+                const double z = std::exp(-x);
+                return 1.0 / (1.0 + z);
+            }
+            const double z = std::exp(x);
+            return z / (1.0 + z);
+        };
+
         auto clamp_times_to_geometry =
             [direct_piece_num, time_lb, time_ub, simple_vel_max,
              target_vel, time_upper_scale, &point_at](
@@ -439,8 +474,37 @@ namespace gcopter
             return times;
         };
 
+        auto recover_profile_times =
+            [direct_piece_num, time_lb, simple_vel_max, time_floor_scale,
+             slack_min_scale, slack_max_scale, &point_at, &sigmoid](
+                const Eigen::Matrix3Xd &points,
+                const Eigen::VectorXd &beta,
+                const double gamma) -> Eigen::VectorXd
+        {
+            Eigen::VectorXd floor_times(direct_piece_num);
+            for (int i = 0; i < direct_piece_num; ++i)
+            {
+                const double segment_length =
+                    (point_at(points, i + 1) - point_at(points, i)).norm();
+                floor_times(i) =
+                    std::max(time_lb,
+                             time_floor_scale * segment_length / simple_vel_max);
+            }
+
+            const double floor_sum =
+                std::max(GCOPTER_PolytopeSFC::positiveEps(), floor_times.sum());
+            const double slack_min = slack_min_scale * floor_sum;
+            const double slack_max = std::max(slack_min, slack_max_scale * floor_sum);
+            const double slack_total =
+                slack_min + sigmoid(gamma) * (slack_max - slack_min);
+            const Eigen::VectorXd ratio = GCOPTER_PolytopeSFC::softmax(beta);
+            Eigen::VectorXd times = floor_times + ratio * slack_total;
+            return times;
+        };
+
         auto unpack_direct =
-            [point_count, time_offset, direct_piece_num, direct_dim,
+            [point_count, time_param_offset, gamma_offset, direct_piece_num,
+             direct_dim, use_time_profile, &recover_profile_times,
              &clamp_times_to_geometry](
                 const Eigen::VectorXd &y,
                 Eigen::Matrix3Xd &candidate_points,
@@ -456,45 +520,87 @@ namespace gcopter
             {
                 candidate_points.col(i) = y.segment<3>(3 * i);
             }
-            candidate_times =
-                clamp_times_to_geometry(candidate_points,
-                                        y.segment(time_offset, direct_piece_num));
+            if (use_time_profile)
+            {
+                const Eigen::VectorXd beta =
+                    y.segment(time_param_offset, direct_piece_num);
+                candidate_times =
+                    recover_profile_times(candidate_points, beta, y(gamma_offset));
+            }
+            else
+            {
+                candidate_times =
+                    clamp_times_to_geometry(
+                        candidate_points,
+                        y.segment(time_param_offset, direct_piece_num));
+            }
             return candidate_times.allFinite() &&
                    (candidate_times.array() > 0.0).all();
         };
 
-        auto corridor_union_violation =
-            [this](const Eigen::Vector3d &position) -> double
+        struct CorridorClearance
+        {
+            double violation = 0.0;
+            double clearance = std::numeric_limits<double>::infinity();
+        };
+
+        auto corridor_clearance =
+            [this](const Eigen::Vector3d &position) -> CorridorClearance
         {
             if (hPolytopes.empty())
             {
-                return 0.0;
+                return CorridorClearance{};
             }
 
             double best_violation = std::numeric_limits<double>::infinity();
+            double best_clearance = -std::numeric_limits<double>::infinity();
+            double best_outside_clearance = -std::numeric_limits<double>::infinity();
+            bool has_inside_poly = false;
+
             for (const PolyhedronH &h_poly : hPolytopes)
             {
                 double poly_violation = -std::numeric_limits<double>::infinity();
+                double poly_clearance = std::numeric_limits<double>::infinity();
                 for (int row = 0; row < h_poly.rows(); ++row)
                 {
+                    const double normal_norm =
+                        std::max(positiveEps(), h_poly.block<1, 3>(row, 0).norm());
+                    const double signed_distance =
+                        (h_poly.block<1, 3>(row, 0).dot(position) +
+                         h_poly(row, 3)) /
+                        normal_norm;
                     poly_violation =
-                        std::max(poly_violation,
-                                 h_poly.block<1, 3>(row, 0).dot(position) +
-                                     h_poly(row, 3));
+                        std::max(poly_violation, signed_distance);
+                    poly_clearance =
+                        std::min(poly_clearance, -signed_distance);
                 }
-                best_violation = std::min(best_violation, poly_violation);
-            }
-            return std::max(0.0, best_violation);
-        };
 
-        auto collision_violation =
-            [&options, &corridor_union_violation](const Eigen::Vector3d &position) -> double
-        {
-            if (options.meta_optimizer_collision_checker)
-            {
-                return options.meta_optimizer_collision_checker(position) ? 1.0 : 0.0;
+                if (poly_violation <= 0.0)
+                {
+                    has_inside_poly = true;
+                    best_clearance = std::max(best_clearance, poly_clearance);
+                }
+                else if (poly_violation < best_violation)
+                {
+                    best_violation = poly_violation;
+                    best_outside_clearance = poly_clearance;
+                }
             }
-            return corridor_union_violation(position);
+
+            CorridorClearance result;
+            if (has_inside_poly)
+            {
+                result.violation = 0.0;
+                result.clearance = std::max(0.0, best_clearance);
+                return result;
+            }
+
+            result.violation = std::max(0.0, best_violation);
+            result.clearance =
+                std::isfinite(best_outside_clearance)
+                    ? best_outside_clearance
+                    : -result.violation;
+            return result;
         };
 
         auto build_direct_trajectory =
@@ -521,29 +627,21 @@ namespace gcopter
         };
 
         auto evaluate_simple_candidate =
-            [this, &options, &unpack_direct, &build_direct_trajectory,
-             &collision_violation, sample_dt, simple_vel_max, simple_acc_max](
-                const Eigen::VectorXd &candidate_y,
+            [this, &options, &corridor_clearance,
+             direct_piece_num, sample_dt, simple_vel_max, simple_acc_max, eps](
+                const MINCOBlackboxOptimizerS3::Candidate &candidate,
                 TrajectoryViolationMetrics *metrics,
                 Trajectory<5> *traj) -> double
         {
-            Eigen::Matrix3Xd candidate_points;
-            Eigen::VectorXd candidate_times;
-            if (!unpack_direct(candidate_y, candidate_points, candidate_times))
-            {
-                if (metrics)
-                {
-                    *metrics = TrajectoryViolationMetrics();
-                }
-                return std::numeric_limits<double>::infinity();
-            }
-
-            minco::MINCO_S3NU direct_minco;
-            Trajectory<5> direct_traj;
-            double trajectory_energy = 0.0;
-            if (!build_direct_trajectory(candidate_points, candidate_times,
-                                         direct_minco, direct_traj,
-                                         trajectory_energy))
+            const Eigen::VectorXd &candidate_times = candidate.times;
+            const Trajectory<5> &direct_traj = candidate.trajectory;
+            if (candidate.points.cols() != direct_piece_num - 1 ||
+                candidate_times.size() != direct_piece_num ||
+                !candidate.points.allFinite() ||
+                !candidate_times.allFinite() ||
+                (candidate_times.array() <= eps).any() ||
+                !std::isfinite(candidate.energy) ||
+                direct_traj.getPieceNum() <= 0)
             {
                 if (metrics)
                 {
@@ -558,10 +656,20 @@ namespace gcopter
                 std::max(1, static_cast<int>(std::ceil(total_time / sample_dt)));
             const double step = total_time / static_cast<double>(sample_count);
 
+            const double clearance_margin = 0.25;
+            const bool use_collision_length_cost =
+                options.meta_optimizer_use_collision_length_cost &&
+                static_cast<bool>(options.meta_optimizer_collision_checker);
             double collision_length = 0.0;
+            double clearance_margin_integral = 0.0;
+            double outside_violation_integral = 0.0;
+            double peak_corridor_violation = 0.0;
+            double occupancy_integral = 0.0;
+            double occupancy_peak = 0.0;
             double velocity_exceed_integral = 0.0;
             double acceleration_exceed_integral = 0.0;
             Eigen::Vector3d previous_position = direct_traj.getPos(0.0);
+            bool previous_occupied = false;
 
             for (int i = 0; i <= sample_count; ++i)
             {
@@ -575,10 +683,39 @@ namespace gcopter
 
                 const double segment_length =
                     i > 0 ? (position - previous_position).norm() : 0.0;
-                const double collision = collision_violation(position);
-                if (collision > 0.0)
+                const bool occupied =
+                    options.meta_optimizer_collision_checker &&
+                    options.meta_optimizer_collision_checker(position);
+
+                // MetaPlanner-style collision length: mark colliding samples,
+                // then add the following spatial segment length.
+                if (i > 0 && previous_occupied)
                 {
                     collision_length += segment_length;
+                }
+
+                if (!use_collision_length_cost)
+                {
+                    const CorridorClearance clearance =
+                        corridor_clearance(position);
+                    const double clearance_deficit =
+                        std::max(0.0, clearance_margin - clearance.clearance) /
+                        std::max(eps, clearance_margin);
+                    clearance_margin_integral +=
+                        node * step * clearance_deficit * clearance_deficit;
+                    outside_violation_integral +=
+                        node * step * clearance.violation * clearance.violation;
+                    peak_corridor_violation =
+                        std::max(peak_corridor_violation, clearance.violation);
+                    local_metrics.max_corridor_violation =
+                        std::max(local_metrics.max_corridor_violation,
+                                 clearance.violation);
+                }
+
+                if (occupied)
+                {
+                    occupancy_integral += node * step;
+                    occupancy_peak = 1.0;
                 }
 
                 const double velocity_violation =
@@ -589,9 +726,6 @@ namespace gcopter
                 velocity_exceed_integral += node * step * velocity_violation;
                 acceleration_exceed_integral += node * step * acceleration_violation;
 
-                local_metrics.max_corridor_violation =
-                    std::max(local_metrics.max_corridor_violation,
-                             collision);
                 local_metrics.max_velocity_violation =
                     std::max(local_metrics.max_velocity_violation,
                              velocity_violation);
@@ -599,19 +733,37 @@ namespace gcopter
                     std::max(local_metrics.max_acceleration_violation,
                              acceleration_violation);
                 ++local_metrics.sample_count;
+                previous_occupied = occupied;
                 previous_position = position;
             }
 
+            const double inv_total_time =
+                1.0 / std::max(sample_dt, std::max(eps, total_time));
+            const double clearance_collision_cost =
+                clearance_margin_integral * inv_total_time +
+                outside_violation_integral * inv_total_time +
+                peak_corridor_violation * peak_corridor_violation +
+                10.0 * occupancy_integral * inv_total_time +
+                10.0 * occupancy_peak;
+            const double collision_cost =
+                use_collision_length_cost ? collision_length
+                                          : clearance_collision_cost;
+            if (use_collision_length_cost)
+            {
+                local_metrics.max_corridor_violation =
+                    std::max(local_metrics.max_corridor_violation,
+                             collision_length);
+            }
             const double fitness =
                 std::max(0.0, options.meta_optimizer_time_weight) * total_time +
-                std::max(0.0, options.meta_optimizer_collision_weight) * collision_length +
+                std::max(0.0, options.meta_optimizer_collision_weight) * collision_cost +
                 std::max(0.0, options.meta_optimizer_velocity_weight) *
                     velocity_exceed_integral / sample_dt +
                 std::max(0.0, options.meta_optimizer_acceleration_weight) *
                     acceleration_exceed_integral / sample_dt;
 
             local_metrics.penalty_cost =
-                std::max(0.0, options.meta_optimizer_collision_weight) * collision_length +
+                std::max(0.0, options.meta_optimizer_collision_weight) * collision_cost +
                 std::max(0.0, options.meta_optimizer_velocity_weight) *
                     velocity_exceed_integral / sample_dt +
                 std::max(0.0, options.meta_optimizer_acceleration_weight) *
@@ -670,48 +822,151 @@ namespace gcopter
             return x.allFinite();
         };
 
+        const Eigen::VectorXd fallback_x =
+            initialX.size() == getDecisionDim() && initialX.allFinite()
+                ? initialX
+                : getCommonInitialGuess();
+
+        auto build_anchor_points =
+            [this, point_count, &workspace_min, &workspace_max](
+                const Eigen::VectorXd &x,
+                Eigen::Matrix3Xd &anchors) -> bool
+        {
+            if (x.size() != getDecisionDim() || point_count <= 0)
+            {
+                return false;
+            }
+
+            minco::MINCO_S3NU seed_minco;
+            if (!buildJerkOpt(x, seed_minco))
+            {
+                return false;
+            }
+
+            Trajectory<5> seed_traj;
+            seed_minco.getTrajectory(seed_traj);
+            const double total_time = seed_traj.getTotalDuration();
+            if (seed_traj.getPieceNum() <= 0 ||
+                !std::isfinite(total_time) ||
+                total_time <= 0.0)
+            {
+                return false;
+            }
+
+            anchors.resize(3, point_count);
+            for (int i = 0; i < point_count; ++i)
+            {
+                const double ratio =
+                    static_cast<double>(i + 1) /
+                    static_cast<double>(point_count + 1);
+                anchors.col(i) =
+                    seed_traj.getPos(ratio * total_time)
+                        .cwiseMax(workspace_min)
+                        .cwiseMin(workspace_max);
+            }
+            return anchors.allFinite();
+        };
+
         Eigen::VectorXd y0 = Eigen::VectorXd::Zero(direct_dim);
+        Eigen::Matrix3Xd anchor_points(3, point_count);
         const Eigen::Vector3d start = headPVA.col(0);
         const Eigen::Vector3d goal = tailPVA.col(0);
+        if (!build_anchor_points(fallback_x, anchor_points))
+        {
+            for (int i = 0; i < point_count; ++i)
+            {
+                const double ratio =
+                    static_cast<double>(i + 1) /
+                    static_cast<double>(point_count + 1);
+                anchor_points.col(i) = (1.0 - ratio) * start + ratio * goal;
+            }
+        }
         for (int i = 0; i < point_count; ++i)
         {
-            const double ratio =
-                static_cast<double>(i + 1) /
-                static_cast<double>(point_count + 1);
-            y0.segment<3>(3 * i) = (1.0 - ratio) * start + ratio * goal;
+            y0.segment<3>(3 * i) =
+                anchor_points.col(i)
+                    .cwiseMax(workspace_min)
+                    .cwiseMin(workspace_max);
         }
-
-        Eigen::Matrix3Xd y0_points(3, point_count);
-        for (int i = 0; i < point_count; ++i)
+        if (use_time_profile)
         {
-            y0_points.col(i) = y0.segment<3>(3 * i);
+            y0.segment(time_param_offset, direct_piece_num).setZero();
+            y0(gamma_offset) = 0.0;
         }
-        Eigen::VectorXd y0_times(direct_piece_num);
-        const double initial_time_scale =
-            std::max(1.0, options.meta_initial_time_scale);
-        for (int i = 0; i < direct_piece_num; ++i)
+        else
         {
-            const double segment_length =
-                (point_at(y0_points, i + 1) - point_at(y0_points, i)).norm();
-            y0_times(i) =
-                std::max(time_lb,
-                         initial_time_scale * segment_length / target_vel);
+            Eigen::VectorXd y0_times(direct_piece_num);
+            const double initial_time_scale =
+                std::max(1.0, options.meta_initial_time_scale);
+            for (int i = 0; i < direct_piece_num; ++i)
+            {
+                const double segment_length =
+                    (point_at(anchor_points, i + 1) -
+                     point_at(anchor_points, i))
+                        .norm();
+                y0_times(i) =
+                    std::max(time_lb,
+                             initial_time_scale * segment_length / target_vel);
+            }
+            y0.segment(time_param_offset, direct_piece_num) =
+                clamp_times_to_geometry(anchor_points, y0_times);
         }
-        y0.segment(time_offset, direct_piece_num) =
-            clamp_times_to_geometry(y0_points, y0_times);
 
         Eigen::VectorXd lower(direct_dim);
         Eigen::VectorXd upper(direct_dim);
         for (int i = 0; i < point_count; ++i)
         {
-            lower.segment<3>(3 * i) = workspace_min;
-            upper.segment<3>(3 * i) = workspace_max;
+            const Eigen::Vector3d anchor =
+                anchor_points.col(i)
+                    .cwiseMax(workspace_min)
+                    .cwiseMin(workspace_max);
+            Eigen::Vector3d local_lower =
+                (anchor.array() - local_box_radius).matrix().cwiseMax(workspace_min);
+            Eigen::Vector3d local_upper =
+                (anchor.array() + local_box_radius).matrix().cwiseMin(workspace_max);
+            local_lower = local_lower.cwiseMin(anchor);
+            local_upper = local_upper.cwiseMax(anchor);
+            lower.segment<3>(3 * i) = local_lower;
+            upper.segment<3>(3 * i) = local_upper;
         }
-        lower.segment(time_offset, direct_piece_num).setConstant(time_lb);
-        upper.segment(time_offset, direct_piece_num).setConstant(time_ub);
+        if (use_time_profile)
+        {
+            lower.segment(time_param_offset, direct_piece_num).setConstant(-beta_bound);
+            upper.segment(time_param_offset, direct_piece_num).setConstant(beta_bound);
+            lower(gamma_offset) = -gamma_bound;
+            upper(gamma_offset) = gamma_bound;
+        }
+        else
+        {
+            lower.segment(time_param_offset, direct_piece_num).setConstant(time_lb);
+            upper.segment(time_param_offset, direct_piece_num).setConstant(time_ub);
+        }
         y0 = y0.cwiseMax(lower).cwiseMin(upper);
 
-        IGO igo;
+        MINCOBlackboxOptimizerS3 direct_optimizer;
+        MINCOBlackboxOptimizerS3::Options direct_optimizer_options;
+        direct_optimizer_options.time_mode =
+            use_time_profile ? MINCOBlackboxOptimizerS3::TimeMode::Profile
+                             : MINCOBlackboxOptimizerS3::TimeMode::Direct;
+        direct_optimizer_options.time_lb = time_lb;
+        direct_optimizer_options.time_ub = time_ub;
+        direct_optimizer_options.simple_vel_max = simple_vel_max;
+        direct_optimizer_options.target_vel = target_vel;
+        direct_optimizer_options.time_floor_scale = time_floor_scale;
+        direct_optimizer_options.initial_time_scale =
+            std::max(1.0, options.meta_initial_time_scale);
+        direct_optimizer_options.total_slack_min_scale = slack_min_scale;
+        direct_optimizer_options.total_slack_max_scale = slack_max_scale;
+        direct_optimizer_options.beta_bound = beta_bound;
+        direct_optimizer_options.gamma_bound = gamma_bound;
+        direct_optimizer_options.local_box_radius = local_box_radius;
+        direct_optimizer.setWarmStartDecision(y0);
+        const bool direct_optimizer_ready =
+            direct_optimizer.setup(headPVA, tailPVA,
+                                   anchor_points,
+                                   workspace_min, workspace_max,
+                                   direct_optimizer_options);
+
         IGO::Options igoOptions;
         igoOptions.population = options.population;
         igoOptions.max_iterations = options.max_iterations;
@@ -727,7 +982,10 @@ namespace gcopter
         igoOptions.initial_sigma_scale = 0.25;
 
         IGO::Budget budget;
-        budget.max_evaluations = options.max_evaluations;
+        budget.max_evaluations =
+            options.max_evaluations > 0
+                ? options.max_evaluations
+                : std::max(300, 10 * std::max(2, options.population));
         budget.max_wall_time = options.max_wall_time;
 
         const int archive_limit = std::max(1, options.archive_top_k);
@@ -736,6 +994,7 @@ namespace gcopter
             Eigen::VectorXd y;
             double cost = std::numeric_limits<double>::infinity();
             double max_violation = std::numeric_limits<double>::infinity();
+            bool feasible = false;
         };
 
         std::vector<DirectCandidate> archive;
@@ -758,6 +1017,14 @@ namespace gcopter
                           {
                               return lhs_finite;
                           }
+                          if (lhs.feasible != rhs.feasible)
+                          {
+                              return lhs.feasible;
+                          }
+                          if (!lhs.feasible && lhs.max_violation != rhs.max_violation)
+                          {
+                              return lhs.max_violation < rhs.max_violation;
+                          }
                           if (lhs.cost != rhs.cost)
                           {
                               return lhs.cost < rhs.cost;
@@ -773,8 +1040,25 @@ namespace gcopter
             }
         };
 
+        auto evaluate_built_direct_candidate =
+            [&evaluate_simple_candidate, &options](
+                const MINCOBlackboxOptimizerS3::Candidate &candidate,
+                DirectCandidate &evaluated) -> bool
+        {
+            TrajectoryViolationMetrics local_metrics;
+            evaluated.y = candidate.y;
+            evaluated.cost =
+                evaluate_simple_candidate(candidate, &local_metrics, nullptr);
+            evaluated.max_violation = local_metrics.maxViolation();
+            evaluated.feasible =
+                std::isfinite(evaluated.cost) &&
+                evaluated.max_violation <= std::max(0.0, options.feasibility_tol);
+            return std::isfinite(evaluated.cost);
+        };
+
         auto evaluate_direct_candidate =
-            [&unpack_direct, &evaluate_simple_candidate](
+            [&unpack_direct, &build_direct_trajectory,
+             &evaluate_built_direct_candidate](
                 const Eigen::VectorXd &candidate_y,
                 DirectCandidate &evaluated) -> bool
         {
@@ -785,42 +1069,72 @@ namespace gcopter
                 evaluated.y = candidate_y;
                 evaluated.cost = std::numeric_limits<double>::infinity();
                 evaluated.max_violation = std::numeric_limits<double>::infinity();
+                evaluated.feasible = false;
                 return false;
             }
 
-            TrajectoryViolationMetrics local_metrics;
-            evaluated.y = candidate_y;
-            evaluated.cost =
-                evaluate_simple_candidate(candidate_y, &local_metrics, nullptr);
-            evaluated.max_violation = local_metrics.maxViolation();
-            return std::isfinite(evaluated.cost);
+            minco::MINCO_S3NU direct_minco;
+            MINCOBlackboxOptimizerS3::Candidate candidate;
+            candidate.y = candidate_y;
+            candidate.points = candidate_points;
+            candidate.times = candidate_times;
+            if (!build_direct_trajectory(candidate.points, candidate.times,
+                                         direct_minco, candidate.trajectory,
+                                         candidate.energy))
+            {
+                evaluated.y = candidate_y;
+                evaluated.cost = std::numeric_limits<double>::infinity();
+                evaluated.max_violation = std::numeric_limits<double>::infinity();
+                evaluated.feasible = false;
+                return false;
+            }
+
+            return evaluate_built_direct_candidate(candidate, evaluated);
         };
 
         const std::chrono::steady_clock::time_point start_time =
             std::chrono::steady_clock::now();
-        const IGO::Result igoResult = igo.optimize(
-            lower, upper, y0,
-            [&insert_meta_candidate, &evaluate_direct_candidate](const Eigen::VectorXd &candidate_y) -> std::pair<double, bool>
-            {
-                DirectCandidate evaluated;
-                const bool is_finite =
+        MINCOBlackboxOptimizerS3::Result blackbox_result;
+        IGO::Result igoResult;
+        if (direct_optimizer_ready)
+        {
+            blackbox_result = direct_optimizer.optimize(
+                [&insert_meta_candidate, &evaluate_built_direct_candidate](
+                    const MINCOBlackboxOptimizerS3::Candidate &candidate) -> std::pair<double, bool>
+                {
+                    DirectCandidate evaluated;
+                    evaluate_built_direct_candidate(candidate, evaluated);
+                    insert_meta_candidate(evaluated);
+                    return std::make_pair(evaluated.cost, evaluated.feasible);
+                },
+                igoOptions,
+                budget);
+            igoResult = blackbox_result.igo_result;
+        }
+        else
+        {
+            IGO igo;
+            igoResult = igo.optimize(
+                lower, upper, y0,
+                [&insert_meta_candidate, &evaluate_direct_candidate](const Eigen::VectorXd &candidate_y) -> std::pair<double, bool>
+                {
+                    DirectCandidate evaluated;
                     evaluate_direct_candidate(candidate_y, evaluated);
-                insert_meta_candidate(evaluated);
-                return std::make_pair(evaluated.cost, is_finite);
-            },
-            igoOptions,
-            budget);
+                    insert_meta_candidate(evaluated);
+                    return std::make_pair(evaluated.cost, evaluated.feasible);
+                },
+                igoOptions,
+                budget);
+        }
 
         DirectCandidate initial_candidate;
-        if (evaluate_direct_candidate(y0, initial_candidate))
+        const Eigen::VectorXd initial_y =
+            direct_optimizer_ready ? direct_optimizer.initialGuess() : y0;
+        if (evaluate_direct_candidate(initial_y, initial_candidate))
         {
             insert_meta_candidate(initial_candidate);
         }
 
-        const Eigen::VectorXd fallback_x =
-            initialX.size() == getDecisionDim() && initialX.allFinite()
-                ? initialX
-                : getCommonInitialGuess();
         const DirectCandidate *best_direct = nullptr;
         if (!archive.empty())
         {
@@ -846,40 +1160,86 @@ namespace gcopter
 
         if (result.hit_time_budget)
         {
-            result.status = "MetaPlanner-style fixed P,T IGO optimizer (wall-clock budget reached)";
+            result.status = "MetaPlanner-style " + direct_mode_name +
+                            " IGO optimizer (wall-clock budget reached)";
         }
         else if (result.hit_eval_budget)
         {
-            result.status = "MetaPlanner-style fixed P,T IGO optimizer (evaluation budget reached)";
+            result.status = "MetaPlanner-style " + direct_mode_name +
+                            " IGO optimizer (evaluation budget reached)";
         }
         else if (igoResult.converged)
         {
-            result.status = "MetaPlanner-style fixed P,T IGO optimizer (converged)";
+            result.status = "MetaPlanner-style " + direct_mode_name +
+                            " IGO optimizer (converged)";
         }
         else
         {
-            result.status = "MetaPlanner-style fixed P,T IGO optimizer";
+            result.status = "MetaPlanner-style " + direct_mode_name +
+                            " IGO optimizer";
         }
 
         if (best_direct != nullptr)
         {
-            Trajectory<5> direct_traj;
-            result.objective =
-                evaluate_simple_candidate(best_direct->y, &result.violations, &direct_traj);
-
-            Eigen::Matrix3Xd direct_points;
-            Eigen::VectorXd direct_times;
-            if (std::isfinite(result.objective) &&
-                direct_traj.getPieceNum() > 0 &&
-                unpack_direct(best_direct->y, direct_points, direct_times))
+            MINCOBlackboxOptimizerS3::Candidate final_candidate;
+            if (direct_optimizer_ready &&
+                direct_optimizer.buildCandidate(best_direct->y, final_candidate))
             {
-                result.has_solution = true;
-                result.total_duration = direct_traj.getTotalDuration();
-                result.trajectory_length =
-                    approximateTrajectoryLength(direct_traj, std::max(8, 4 * integralRes));
-                result.has_meta_direct_solution = true;
-                result.meta_direct_points = direct_points;
-                result.meta_direct_times = direct_times;
+                result.objective =
+                    evaluate_simple_candidate(final_candidate,
+                                              &result.violations,
+                                              nullptr);
+
+                if (std::isfinite(result.objective) &&
+                    final_candidate.trajectory.getPieceNum() > 0)
+                {
+                    result.has_solution = true;
+                    result.total_duration =
+                        final_candidate.trajectory.getTotalDuration();
+                    result.trajectory_length =
+                        approximateTrajectoryLength(final_candidate.trajectory,
+                                                    std::max(8, 4 * integralRes));
+                    result.has_meta_direct_solution = true;
+                    result.meta_direct_points = final_candidate.points;
+                    result.meta_direct_times = final_candidate.times;
+                }
+            }
+            else
+            {
+                Eigen::Matrix3Xd direct_points;
+                Eigen::VectorXd direct_times;
+                if (unpack_direct(best_direct->y, direct_points, direct_times))
+                {
+                    minco::MINCO_S3NU direct_minco;
+                    MINCOBlackboxOptimizerS3::Candidate final_candidate;
+                    final_candidate.y = best_direct->y;
+                    final_candidate.points = direct_points;
+                    final_candidate.times = direct_times;
+                    if (build_direct_trajectory(final_candidate.points,
+                                                final_candidate.times,
+                                                direct_minco,
+                                                final_candidate.trajectory,
+                                                final_candidate.energy))
+                    {
+                        result.objective =
+                            evaluate_simple_candidate(final_candidate,
+                                                      &result.violations,
+                                                      nullptr);
+                        if (std::isfinite(result.objective) &&
+                            final_candidate.trajectory.getPieceNum() > 0)
+                        {
+                            result.has_solution = true;
+                            result.total_duration =
+                                final_candidate.trajectory.getTotalDuration();
+                            result.trajectory_length =
+                                approximateTrajectoryLength(final_candidate.trajectory,
+                                                            std::max(8, 4 * integralRes));
+                            result.has_meta_direct_solution = true;
+                            result.meta_direct_points = direct_points;
+                            result.meta_direct_times = direct_times;
+                        }
+                    }
+                }
             }
         }
 
@@ -899,7 +1259,8 @@ namespace gcopter
         }
         result.status = result.status + " [fixed " +
                         std::to_string(point_count) +
-                        "-midpoint direct P,T simple cost]";
+                        "-midpoint direct " + direct_mode_name +
+                        " clearance cost]";
         return result;
     }
 

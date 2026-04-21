@@ -67,18 +67,20 @@ MetaOptimizerTiltWeight: 0.0
 MetaOptimizerThrustWeight: 0.0
 MetaOptimizerMaxAcceleration: 15.0
 MetaOptimizerSampleDt: 0.10
-MetaOptimizerMidpoints: 3
+MetaOptimizerMidpoints: 4
 MetaOptimizerTimeLowerBound: 0.10
 MetaOptimizerTimeUpperBound: 8.0
 MetaOptimizerSimpleMaxVelocity: 4.0
 MetaOptimizerSimpleMaxAcceleration: 15.0
 MetaOptimizerTargetVelocityRatio: 0.90
+MetaOptimizerLocalBoxRadius: 2.0
+MetaOptimizerUseCollisionLengthCost: true
 MetaOptimizerTimeFloorScale: 1.10
 MetaOptimizerInitialTimeScale: 1.18
 MetaOptimizerTotalSlackMinScale: 0.04
 MetaOptimizerTotalSlackMaxScale: 0.65
 MetaOptimizerPopulation: 50
-MetaOptimizerMaxIterations: 500
-MetaOptimizerMaxEvaluations: 0
+MetaOptimizerMaxIterations: 80
+MetaOptimizerMaxEvaluations: 500
 MetaOptimizerMaxWallTime: 0.0
 MetaOptimizerSeeds: [0, 1]

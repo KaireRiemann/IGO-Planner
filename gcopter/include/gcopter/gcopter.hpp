@@ -122,12 +122,15 @@ namespace gcopter
             double meta_optimizer_thrust_weight = 0.0;
             double meta_optimizer_max_acceleration = 15.0;
             double meta_optimizer_sample_dt = 0.10;
-            int meta_optimizer_midpoints = 3;
+            int meta_optimizer_midpoints = 4;
             double meta_optimizer_time_lb = 0.1;
             double meta_optimizer_time_ub = 8.0;
             double meta_optimizer_simple_max_velocity = 4.0;
             double meta_optimizer_simple_max_acceleration = 15.0;
             double meta_optimizer_target_velocity_ratio = 0.90;
+            double meta_optimizer_local_box_radius = 2.0;
+            bool meta_optimizer_use_time_profile = true;
+            bool meta_optimizer_use_collision_length_cost = true;
             bool meta_optimizer_has_workspace_bounds = false;
             Eigen::Vector3d meta_optimizer_workspace_min = Eigen::Vector3d::Zero();
             Eigen::Vector3d meta_optimizer_workspace_max = Eigen::Vector3d::Zero();

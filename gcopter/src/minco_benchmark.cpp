@@ -53,9 +53,16 @@ namespace
 
         double feasibility_tolerance = 1.0e-4;
 
+        bool run_lbfgs = true;
+        bool run_igo = true;
+        bool run_meta = true;
+        bool run_meta_pt = true;
+
         gcopter::GCOPTER_PolytopeSFC::LBFGSSolveOptions lbfgs_options;
         gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions igo_options;
+        gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions meta_options;
         std::vector<unsigned int> igo_seeds;
+        std::vector<unsigned int> meta_seeds;
 
         BenchmarkConfig()
         {
@@ -80,7 +87,31 @@ namespace
             igo_options.tau_box_radius = 2.5;
             igo_options.xi_box_bound = 1.5;
 
+            meta_options = igo_options;
+            meta_options.population = 50;
+            meta_options.max_iterations = 80;
+            meta_options.max_evaluations = 500;
+            meta_options.max_wall_time = 0.0;
+            meta_options.meta_optimizer_midpoints = 4;
+            meta_options.meta_optimizer_sample_dt = 0.10;
+            meta_options.meta_optimizer_collision_weight = 30.0;
+            meta_options.meta_optimizer_velocity_weight = 20.0;
+            meta_options.meta_optimizer_acceleration_weight = 25.0;
+            meta_options.meta_optimizer_time_weight = 4.0;
+            meta_options.meta_optimizer_simple_max_velocity = 4.0;
+            meta_options.meta_optimizer_simple_max_acceleration = 15.0;
+            meta_options.meta_optimizer_target_velocity_ratio = 0.90;
+            meta_options.meta_optimizer_time_lb = 0.10;
+            meta_options.meta_optimizer_time_ub = 8.0;
+            meta_options.meta_optimizer_local_box_radius = 2.0;
+            meta_options.meta_time_floor_scale = 1.10;
+            meta_options.meta_initial_time_scale = 1.18;
+            meta_options.meta_total_slack_min_scale = 0.04;
+            meta_options.meta_total_slack_max_scale = 0.65;
+            meta_options.meta_optimizer_use_time_profile = true;
+
             igo_seeds = {0, 1, 2, 3, 4};
+            meta_seeds = {0, 1};
         }
     };
 
@@ -426,6 +457,14 @@ namespace
         {
             cfg.feasibility_tolerance = benchmark["feasibility_tolerance"].as<double>();
         }
+        if (benchmark && benchmark["run_lbfgs"])
+        {
+            cfg.run_lbfgs = benchmark["run_lbfgs"].as<bool>();
+        }
+        if (benchmark && benchmark["run_igo"])
+        {
+            cfg.run_igo = benchmark["run_igo"].as<bool>();
+        }
 
         const YAML::Node lbfgs = benchmark["lbfgs"];
         if (lbfgs && lbfgs["rel_cost_tol"])
@@ -489,6 +528,133 @@ namespace
         if (igo && igo["seeds"])
         {
             cfg.igo_seeds = yamlToUIntVector(igo["seeds"]);
+        }
+
+        const YAML::Node meta = benchmark["meta"];
+        if (meta && meta["enabled"])
+        {
+            cfg.run_meta = meta["enabled"].as<bool>();
+        }
+        if (meta && meta["run_pt"])
+        {
+            cfg.run_meta_pt = meta["run_pt"].as<bool>();
+        }
+        if (meta && meta["population"])
+        {
+            cfg.meta_options.population = meta["population"].as<int>();
+        }
+        if (meta && meta["max_iterations"])
+        {
+            cfg.meta_options.max_iterations = meta["max_iterations"].as<int>();
+        }
+        if (meta && meta["max_evaluations"])
+        {
+            cfg.meta_options.max_evaluations = meta["max_evaluations"].as<int>();
+        }
+        if (meta && meta["max_wall_time"])
+        {
+            cfg.meta_options.max_wall_time = meta["max_wall_time"].as<double>();
+        }
+        if (meta && meta["min_sigma"])
+        {
+            cfg.meta_options.min_sigma = meta["min_sigma"].as<double>();
+        }
+        if (meta && meta["eta_mean"])
+        {
+            cfg.meta_options.eta_mean = meta["eta_mean"].as<double>();
+        }
+        if (meta && meta["eta_sigma"])
+        {
+            cfg.meta_options.eta_sigma = meta["eta_sigma"].as<double>();
+        }
+        if (meta && meta["elite_ratio"])
+        {
+            cfg.meta_options.elite_ratio = meta["elite_ratio"].as<double>();
+        }
+        if (meta && meta["time_weight"])
+        {
+            cfg.meta_options.meta_optimizer_time_weight = meta["time_weight"].as<double>();
+        }
+        if (meta && meta["length_weight"])
+        {
+            cfg.meta_options.meta_optimizer_length_weight = meta["length_weight"].as<double>();
+        }
+        if (meta && meta["energy_weight"])
+        {
+            cfg.meta_options.meta_optimizer_energy_weight = meta["energy_weight"].as<double>();
+        }
+        if (meta && meta["waypoint_smooth_weight"])
+        {
+            cfg.meta_options.meta_optimizer_waypoint_smooth_weight = meta["waypoint_smooth_weight"].as<double>();
+        }
+        if (meta && meta["collision_weight"])
+        {
+            cfg.meta_options.meta_optimizer_collision_weight = meta["collision_weight"].as<double>();
+        }
+        if (meta && meta["velocity_weight"])
+        {
+            cfg.meta_options.meta_optimizer_velocity_weight = meta["velocity_weight"].as<double>();
+        }
+        if (meta && meta["acceleration_weight"])
+        {
+            cfg.meta_options.meta_optimizer_acceleration_weight = meta["acceleration_weight"].as<double>();
+        }
+        if (meta && meta["sample_dt"])
+        {
+            cfg.meta_options.meta_optimizer_sample_dt = meta["sample_dt"].as<double>();
+        }
+        if (meta && meta["midpoints"])
+        {
+            cfg.meta_options.meta_optimizer_midpoints = meta["midpoints"].as<int>();
+        }
+        if (meta && meta["time_lower_bound"])
+        {
+            cfg.meta_options.meta_optimizer_time_lb = meta["time_lower_bound"].as<double>();
+        }
+        if (meta && meta["time_upper_bound"])
+        {
+            cfg.meta_options.meta_optimizer_time_ub = meta["time_upper_bound"].as<double>();
+        }
+        if (meta && meta["simple_max_velocity"])
+        {
+            cfg.meta_options.meta_optimizer_simple_max_velocity = meta["simple_max_velocity"].as<double>();
+        }
+        if (meta && meta["simple_max_acceleration"])
+        {
+            cfg.meta_options.meta_optimizer_simple_max_acceleration = meta["simple_max_acceleration"].as<double>();
+        }
+        if (meta && meta["target_velocity_ratio"])
+        {
+            cfg.meta_options.meta_optimizer_target_velocity_ratio = meta["target_velocity_ratio"].as<double>();
+        }
+        if (meta && meta["local_box_radius"])
+        {
+            cfg.meta_options.meta_optimizer_local_box_radius = meta["local_box_radius"].as<double>();
+        }
+        if (meta && meta["use_collision_length_cost"])
+        {
+            cfg.meta_options.meta_optimizer_use_collision_length_cost =
+                meta["use_collision_length_cost"].as<bool>();
+        }
+        if (meta && meta["time_floor_scale"])
+        {
+            cfg.meta_options.meta_time_floor_scale = meta["time_floor_scale"].as<double>();
+        }
+        if (meta && meta["initial_time_scale"])
+        {
+            cfg.meta_options.meta_initial_time_scale = meta["initial_time_scale"].as<double>();
+        }
+        if (meta && meta["total_slack_min_scale"])
+        {
+            cfg.meta_options.meta_total_slack_min_scale = meta["total_slack_min_scale"].as<double>();
+        }
+        if (meta && meta["total_slack_max_scale"])
+        {
+            cfg.meta_options.meta_total_slack_max_scale = meta["total_slack_max_scale"].as<double>();
+        }
+        if (meta && meta["seeds"])
+        {
+            cfg.meta_seeds = yamlToUIntVector(meta["seeds"]);
         }
 
         return cfg;
@@ -830,6 +996,7 @@ namespace
             << result.violations.maxViolation() << ","
             << result.violations.max_corridor_violation << ","
             << result.violations.max_velocity_violation << ","
+            << result.violations.max_acceleration_violation << ","
             << result.violations.max_body_rate_violation << ","
             << result.violations.max_tilt_violation << ","
             << result.violations.max_thrust_violation << ","
@@ -848,7 +1015,8 @@ namespace
         out << "instance_id,solver,seed,success,has_solution,converged,hit_eval_budget,hit_time_budget,"
                "solver_status,iterations,eval_count,wall_time_sec,objective,total_duration_sec,"
                "trajectory_length,max_violation,max_corridor_violation,max_velocity_violation,"
-               "max_body_rate_violation,max_tilt_violation,max_thrust_violation,penalty_cost,"
+               "max_acceleration_violation,max_body_rate_violation,max_tilt_violation,"
+               "max_thrust_violation,penalty_cost,"
                "sample_count,generator_seed,status\n";
 
         for (const BenchmarkInstance &instance : instances)
@@ -879,18 +1047,48 @@ namespace
                 x0 = solver.getCommonInitialGuess();
             }
 
-            const gcopter::GCOPTER_PolytopeSFC::SolverResult lbfgs_result =
-                solver.solveLBFGS(x0, cfg.lbfgs_options);
-            appendResultRow(out, instance, "LBFGS", -1, lbfgs_result, cfg.feasibility_tolerance);
-
-            for (std::size_t i = 0; i < cfg.igo_seeds.size(); ++i)
+            if (cfg.run_lbfgs)
             {
-                gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions igo_options = cfg.igo_options;
-                igo_options.seed = cfg.igo_seeds[i];
-                const gcopter::GCOPTER_PolytopeSFC::SolverResult igo_result =
-                    solver.solveIGO(x0, igo_options);
-                appendResultRow(out, instance, "IGO", static_cast<int>(cfg.igo_seeds[i]),
-                                igo_result, cfg.feasibility_tolerance);
+                const gcopter::GCOPTER_PolytopeSFC::SolverResult lbfgs_result =
+                    solver.solveLBFGS(x0, cfg.lbfgs_options);
+                appendResultRow(out, instance, "LBFGS", -1, lbfgs_result, cfg.feasibility_tolerance);
+            }
+
+            if (cfg.run_igo)
+            {
+                for (std::size_t i = 0; i < cfg.igo_seeds.size(); ++i)
+                {
+                    gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions igo_options = cfg.igo_options;
+                    igo_options.seed = cfg.igo_seeds[i];
+                    const gcopter::GCOPTER_PolytopeSFC::SolverResult igo_result =
+                        solver.solveIGO(x0, igo_options);
+                    appendResultRow(out, instance, "IGO", static_cast<int>(cfg.igo_seeds[i]),
+                                    igo_result, cfg.feasibility_tolerance);
+                }
+            }
+
+            if (cfg.run_meta)
+            {
+                for (std::size_t i = 0; i < cfg.meta_seeds.size(); ++i)
+                {
+                    gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions meta_options = cfg.meta_options;
+                    meta_options.seed = cfg.meta_seeds[i];
+                    meta_options.meta_optimizer_use_time_profile = true;
+                    const gcopter::GCOPTER_PolytopeSFC::SolverResult meta_result =
+                        solver.solveMetaOptimizer(x0, meta_options);
+                    appendResultRow(out, instance, "META", static_cast<int>(cfg.meta_seeds[i]),
+                                    meta_result, cfg.feasibility_tolerance);
+
+                    if (cfg.run_meta_pt)
+                    {
+                        gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions meta_pt_options = meta_options;
+                        meta_pt_options.meta_optimizer_use_time_profile = false;
+                        const gcopter::GCOPTER_PolytopeSFC::SolverResult meta_pt_result =
+                            solver.solveMetaOptimizer(x0, meta_pt_options);
+                        appendResultRow(out, instance, "META_PT", static_cast<int>(cfg.meta_seeds[i]),
+                                        meta_pt_result, cfg.feasibility_tolerance);
+                    }
+                }
             }
         }
 

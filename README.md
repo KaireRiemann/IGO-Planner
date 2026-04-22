@@ -11,6 +11,7 @@ Supported solvers in `gcopter/src/compare_planning.cpp`:
 * `LBFGS`: the original GCOPTER corridor optimizer.
 * `IGO`: IGO meta search followed by the same LBFGS refinement path.
 * `META`: a MetaPlanner-style derivative-free optimizer over a fixed low-dimensional MINCO_S3 problem. By default it optimizes 3 free intermediate waypoints and 4 direct segment times, then builds the final trajectory directly from those `P,T` variables.
+* `NUBS_META_PT`: the same fixed direct `P,T` black-box search as `META_PT`, but candidate trajectories are generated as NUBS and evaluated with the simple sampled objective.
 
 Run the comparison node with:
 
@@ -37,9 +38,9 @@ Timing columns use the following convention:
 
 * `optimization_time_sec`: optimizer-only runtime.
 * `frontend_time_sec`: path search plus corridor generation time.
-* `wall_time_sec`: benchmark runtime. For `LBFGS`, `IGO`, `IGO_XSPACE`, and `IGO_HEURISTIC`, this includes frontend time. For `META`, frontend time is recorded as zero because the meta-space optimizer is benchmarked as not requiring frontend path search.
+* `wall_time_sec`: benchmark runtime. For `LBFGS`, `IGO`, `IGO_XSPACE`, and `IGO_HEURISTIC`, this includes frontend time. For `META` and `NUBS_META_PT`, frontend time is recorded as zero because the meta-space optimizer is benchmarked as not requiring frontend path search.
 
-Trajectory diagnostics use the solver-specific MINCO_S3 representation. In particular, `jerk_energy` is computed by rebuilding the relevant `MINCO_S3NU` and calling `getEnergy()`, not by numerically integrating sampled jerk values. For `META`, diagnostics use the direct fixed-midpoint `P,T` trajectory instead of a lifted high-dimensional corridor parameterization.
+Trajectory diagnostics use the solver-specific representation. `MINCO_S3` solvers rebuild the relevant `MINCO_S3NU` and call `getEnergy()`; `NUBS_META_PT` rebuilds the direct NUBS candidate and uses its energy. For `META` and `NUBS_META_PT`, diagnostics use the direct fixed-midpoint trajectory instead of a lifted high-dimensional corridor parameterization.
 
 ## Updates
 

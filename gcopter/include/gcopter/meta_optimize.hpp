@@ -5,6 +5,10 @@
 #include "gcopter/minco_blackbox_optimizer.hpp"
 #include "gcopter/trajectory.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 namespace gcopter
 {
     inline double GCOPTER_PolytopeSFC::evaluateMetaPlannerFitness(
@@ -319,9 +323,15 @@ namespace gcopter
                                             const IGOSolveOptions &options)
     {
         SolverResult result;
-        const int point_count = std::max(0, options.meta_optimizer_midpoints);
-        const int direct_piece_num = point_count + 1;
         const bool use_time_profile = options.meta_optimizer_use_time_profile;
+        const bool use_nubs_direct = options.meta_optimizer_use_nubs_direct;
+        const int requested_point_count =
+            std::max(0, options.meta_optimizer_midpoints);
+        const int point_count =
+            use_nubs_direct
+                ? std::max(requested_point_count, std::max(0, pieceN - 1))
+                : requested_point_count;
+        const int direct_piece_num = point_count + 1;
         const int time_param_offset = 3 * point_count;
         const int gamma_offset = time_param_offset + direct_piece_num;
         const int direct_dim =
@@ -330,6 +340,8 @@ namespace gcopter
         const std::string direct_mode_name =
             use_time_profile ? "fixed P,beta,gamma"
                              : "fixed P,T";
+        const std::string direct_family_name =
+            use_nubs_direct ? "NUBS" : "MINCO";
         if (direct_piece_num <= 0 || pieceN <= 0 || direct_dim <= 0)
         {
             result.best_x =
@@ -345,7 +357,8 @@ namespace gcopter
                 result.trajectory_length =
                     approximateTrajectoryLength(local_traj, std::max(8, 4 * integralRes));
             }
-            result.status = "MetaPlanner-style " + direct_mode_name +
+            result.status = "MetaPlanner-style " + direct_family_name +
+                            " " + direct_mode_name +
                             " IGO optimizer (empty decision space)";
             return result;
         }
@@ -626,22 +639,58 @@ namespace gcopter
             return std::isfinite(energy) && trajectory.getPieceNum() > 0;
         };
 
-        auto evaluate_simple_candidate =
+        auto build_direct_nubs =
+            [this, direct_piece_num](const Eigen::Matrix3Xd &candidate_points,
+                                     const Eigen::VectorXd &candidate_times,
+                                     bsplinetrajectory::NUBSTrajectory<3> &trajectory,
+                                     double &energy) -> bool
+        {
+            if (candidate_points.cols() != direct_piece_num - 1 ||
+                candidate_times.size() != direct_piece_num ||
+                !candidate_points.allFinite() ||
+                !candidate_times.allFinite() ||
+                (candidate_times.array() <= positiveEps()).any())
+            {
+                return false;
+            }
+
+            Eigen::MatrixXd control_points;
+            const Eigen::MatrixXd inner_points_rows =
+                candidate_points.cols() > 0 ? candidate_points.transpose()
+                                            : Eigen::MatrixXd(0, 3);
+            try
+            {
+                trajectory.generate(inner_points_rows, headPVA, tailPVA,
+                                    candidate_times, control_points);
+                energy = trajectory.getEnergy();
+            }
+            catch (const std::exception &)
+            {
+                energy = std::numeric_limits<double>::infinity();
+                return false;
+            }
+            return std::isfinite(energy) && trajectory.getPieceNum() > 0;
+        };
+
+        auto evaluate_simple_sampled_candidate =
             [this, &options, &corridor_clearance,
              direct_piece_num, sample_dt, simple_vel_max, simple_acc_max, eps](
-                const MINCOBlackboxOptimizerS3::Candidate &candidate,
-                TrajectoryViolationMetrics *metrics,
-                Trajectory<5> *traj) -> double
+                const Eigen::Matrix3Xd &candidate_points,
+                const Eigen::VectorXd &candidate_times,
+                const double candidate_energy,
+                const int trajectory_piece_num,
+                const auto &position_at,
+                const auto &velocity_at,
+                const auto &acceleration_at,
+                TrajectoryViolationMetrics *metrics) -> double
         {
-            const Eigen::VectorXd &candidate_times = candidate.times;
-            const Trajectory<5> &direct_traj = candidate.trajectory;
-            if (candidate.points.cols() != direct_piece_num - 1 ||
+            if (candidate_points.cols() != direct_piece_num - 1 ||
                 candidate_times.size() != direct_piece_num ||
-                !candidate.points.allFinite() ||
+                !candidate_points.allFinite() ||
                 !candidate_times.allFinite() ||
                 (candidate_times.array() <= eps).any() ||
-                !std::isfinite(candidate.energy) ||
-                direct_traj.getPieceNum() <= 0)
+                !std::isfinite(candidate_energy) ||
+                trajectory_piece_num <= 0)
             {
                 if (metrics)
                 {
@@ -668,8 +717,17 @@ namespace gcopter
             double occupancy_peak = 0.0;
             double velocity_exceed_integral = 0.0;
             double acceleration_exceed_integral = 0.0;
-            Eigen::Vector3d previous_position = direct_traj.getPos(0.0);
+            Eigen::Vector3d previous_position = position_at(0.0);
             bool previous_occupied = false;
+
+            if (!previous_position.allFinite())
+            {
+                if (metrics)
+                {
+                    *metrics = TrajectoryViolationMetrics();
+                }
+                return std::numeric_limits<double>::infinity();
+            }
 
             for (int i = 0; i <= sample_count; ++i)
             {
@@ -677,9 +735,20 @@ namespace gcopter
                     std::min(total_time, step * static_cast<double>(i));
                 const double node =
                     (i == 0 || i == sample_count) ? 0.5 : 1.0;
-                const Eigen::Vector3d position = direct_traj.getPos(t);
-                const Eigen::Vector3d velocity = direct_traj.getVel(t);
-                const Eigen::Vector3d acceleration = direct_traj.getAcc(t);
+                const Eigen::Vector3d position = position_at(t);
+                const Eigen::Vector3d velocity = velocity_at(t);
+                const Eigen::Vector3d acceleration = acceleration_at(t);
+
+                if (!position.allFinite() ||
+                    !velocity.allFinite() ||
+                    !acceleration.allFinite())
+                {
+                    if (metrics)
+                    {
+                        *metrics = TrajectoryViolationMetrics();
+                    }
+                    return std::numeric_limits<double>::infinity();
+                }
 
                 const double segment_length =
                     i > 0 ? (position - previous_position).norm() : 0.0;
@@ -687,8 +756,6 @@ namespace gcopter
                     options.meta_optimizer_collision_checker &&
                     options.meta_optimizer_collision_checker(position);
 
-                // MetaPlanner-style collision length: mark colliding samples,
-                // then add the following spatial segment length.
                 if (i > 0 && previous_occupied)
                 {
                     collision_length += segment_length;
@@ -773,16 +840,463 @@ namespace gcopter
             {
                 *metrics = local_metrics;
             }
-            if (traj)
+            return fitness;
+        };
+
+        auto evaluate_simple_candidate =
+            [&evaluate_simple_sampled_candidate](
+                const MINCOBlackboxOptimizerS3::Candidate &candidate,
+                TrajectoryViolationMetrics *metrics,
+                Trajectory<5> *traj) -> double
+        {
+            const Eigen::VectorXd &candidate_times = candidate.times;
+            const Trajectory<5> &direct_traj = candidate.trajectory;
+            const double fitness =
+                evaluate_simple_sampled_candidate(
+                    candidate.points,
+                    candidate_times,
+                    candidate.energy,
+                    direct_traj.getPieceNum(),
+                    [&direct_traj](const double t) -> Eigen::Vector3d
+                    {
+                        return direct_traj.getPos(t);
+                    },
+                    [&direct_traj](const double t) -> Eigen::Vector3d
+                    {
+                        return direct_traj.getVel(t);
+                    },
+                    [&direct_traj](const double t) -> Eigen::Vector3d
+                    {
+                        return direct_traj.getAcc(t);
+                    },
+                    metrics);
+            if (traj && std::isfinite(fitness))
             {
                 *traj = direct_traj;
             }
             return fitness;
         };
 
+        struct DirectNUBSCandidate
+        {
+            Eigen::VectorXd y;
+            Eigen::Matrix3Xd points;
+            Eigen::VectorXd times;
+            bsplinetrajectory::NUBSTrajectory<3> trajectory;
+            double energy = std::numeric_limits<double>::infinity();
+        };
+
+        auto evaluate_simple_nubs_candidate =
+            [&evaluate_simple_sampled_candidate](
+                const DirectNUBSCandidate &candidate,
+                TrajectoryViolationMetrics *metrics) -> double
+        {
+            const bsplinetrajectory::NUBSTrajectory<3> &direct_traj =
+                candidate.trajectory;
+            return evaluate_simple_sampled_candidate(
+                candidate.points,
+                candidate.times,
+                candidate.energy,
+                direct_traj.getPieceNum(),
+                [&direct_traj](const double t) -> Eigen::Vector3d
+                {
+                    return direct_traj.evaluate(t, 0);
+                },
+                [&direct_traj](const double t) -> Eigen::Vector3d
+                {
+                    return direct_traj.evaluate(t, 1);
+                },
+                [&direct_traj](const double t) -> Eigen::Vector3d
+                {
+                    return direct_traj.evaluate(t, 2);
+                },
+                metrics);
+        };
+
+        auto evaluate_control_point_nubs_candidate =
+            [this, &options, direct_piece_num,
+             simple_vel_max, simple_acc_max, eps](
+                const DirectNUBSCandidate &candidate,
+                TrajectoryViolationMetrics *metrics) -> double
+        {
+            typedef Eigen::Matrix<double, Eigen::Dynamic, 3> MatrixX3d;
+
+            if (candidate.points.cols() != direct_piece_num - 1 ||
+                candidate.times.size() != direct_piece_num ||
+                !candidate.points.allFinite() ||
+                !candidate.times.allFinite() ||
+                (candidate.times.array() <= eps).any() ||
+                !std::isfinite(candidate.energy) ||
+                candidate.trajectory.getPieceNum() <= 0)
+            {
+                if (metrics)
+                {
+                    *metrics = TrajectoryViolationMetrics();
+                }
+                return std::numeric_limits<double>::infinity();
+            }
+
+            const MatrixX3d &control_points =
+                candidate.trajectory.getControlPoints();
+            const Eigen::VectorXd &knots = candidate.trajectory.getKnots();
+            const int degree = candidate.trajectory.getP();
+            if (control_points.rows() <= 0 ||
+                knots.size() <= degree + 1 ||
+                !control_points.allFinite() ||
+                !knots.allFinite())
+            {
+                if (metrics)
+                {
+                    *metrics = TrajectoryViolationMetrics();
+                }
+                return std::numeric_limits<double>::infinity();
+            }
+
+            TrajectoryViolationMetrics local_metrics;
+            const double total_time = candidate.times.sum();
+            if (!std::isfinite(total_time) || total_time <= eps)
+            {
+                if (metrics)
+                {
+                    *metrics = TrajectoryViolationMetrics();
+                }
+                return std::numeric_limits<double>::infinity();
+            }
+
+            auto waypoint_at =
+                [this, &candidate, direct_piece_num](const int idx) -> Eigen::Vector3d
+            {
+                if (idx <= 0)
+                {
+                    return headPVA.col(0);
+                }
+                if (idx >= direct_piece_num)
+                {
+                    return tailPVA.col(0);
+                }
+                return candidate.points.col(idx - 1);
+            };
+
+            double polyline_length = 0.0;
+            for (int i = 0; i < direct_piece_num; ++i)
+            {
+                polyline_length += (waypoint_at(i + 1) - waypoint_at(i)).norm();
+            }
+            const double length_scale = std::max(eps, polyline_length);
+            const double normalized_energy =
+                candidate.energy * std::pow(std::max(eps, total_time), 5.0) /
+                std::max(eps, length_scale * length_scale);
+
+            double collision_accum = 0.0;
+            double collision_peak = 0.0;
+            int collision_span_count = 0;
+            if (!hPolytopes.empty())
+            {
+                for (int span = degree; span < knots.size() - degree - 1; ++span)
+                {
+                    if (knots(span + 1) - knots(span) <= eps)
+                    {
+                        continue;
+                    }
+
+                    const int first_ctrl = std::max(0, span - degree);
+                    const int last_ctrl =
+                        std::min<int>(control_points.rows() - 1, span);
+                    if (first_ctrl > last_ctrl)
+                    {
+                        continue;
+                    }
+
+                    std::vector<int> nearby_poly_indices;
+                    auto add_poly_index =
+                        [&nearby_poly_indices](const int poly_idx) -> void
+                    {
+                        if (poly_idx < 0)
+                        {
+                            return;
+                        }
+                        if (std::find(nearby_poly_indices.begin(),
+                                      nearby_poly_indices.end(),
+                                      poly_idx) == nearby_poly_indices.end())
+                        {
+                            nearby_poly_indices.push_back(poly_idx);
+                        }
+                    };
+                    const int piece_idx = span - degree;
+                    if (hPolyIdx.size() == pieceN &&
+                        direct_piece_num == pieceN)
+                    {
+                        for (int local_piece = piece_idx - 1;
+                             local_piece <= piece_idx + 1;
+                             ++local_piece)
+                        {
+                            if (0 <= local_piece && local_piece < hPolyIdx.size())
+                            {
+                                add_poly_index(hPolyIdx(local_piece));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const double ratio =
+                            (static_cast<double>(piece_idx) + 0.5) /
+                            static_cast<double>(std::max(1, direct_piece_num));
+                        const int center_poly =
+                            static_cast<int>(std::floor(
+                                ratio * static_cast<double>(hPolytopes.size())));
+                        for (int poly_idx = center_poly - 1;
+                             poly_idx <= center_poly + 1;
+                             ++poly_idx)
+                        {
+                            add_poly_index(poly_idx);
+                        }
+                    }
+
+                    double best_poly_cost =
+                        std::numeric_limits<double>::infinity();
+                    double best_poly_peak = 0.0;
+                    int best_term_count = 1;
+                    for (const int poly_idx : nearby_poly_indices)
+                    {
+                        if (poly_idx < 0 ||
+                            poly_idx >= static_cast<int>(hPolytopes.size()))
+                        {
+                            continue;
+                        }
+                        const PolyhedronH &h_poly = hPolytopes[poly_idx];
+                        double poly_cost = 0.0;
+                        double poly_peak = 0.0;
+                        int term_count = 0;
+                        for (int ctrl_idx = first_ctrl;
+                             ctrl_idx <= last_ctrl;
+                             ++ctrl_idx)
+                        {
+                            const Eigen::Vector3d cp =
+                                control_points.row(ctrl_idx).transpose();
+                            for (int row = 0; row < h_poly.rows(); ++row)
+                            {
+                                const double normal_norm =
+                                    std::max(eps,
+                                             h_poly.block<1, 3>(row, 0).norm());
+                                const double signed_distance =
+                                    (h_poly.block<1, 3>(row, 0).dot(cp) +
+                                     h_poly(row, 3)) /
+                                    normal_norm;
+                                const double violation =
+                                    std::max(0.0, signed_distance);
+                                poly_cost += violation * violation;
+                                poly_peak = std::max(poly_peak, violation);
+                                ++term_count;
+                            }
+                        }
+
+                        if (poly_cost < best_poly_cost)
+                        {
+                            best_poly_cost = poly_cost;
+                            best_poly_peak = poly_peak;
+                            best_term_count = std::max(1, term_count);
+                        }
+                    }
+
+                    if (std::isfinite(best_poly_cost))
+                    {
+                        collision_accum +=
+                            best_poly_cost /
+                            static_cast<double>(std::max(1, best_term_count));
+                        collision_peak = std::max(collision_peak, best_poly_peak);
+                        local_metrics.max_corridor_violation =
+                            std::max(local_metrics.max_corridor_violation,
+                                     best_poly_peak);
+                        ++collision_span_count;
+                    }
+                }
+            }
+            else if (options.meta_optimizer_collision_checker)
+            {
+                for (int i = 0; i < control_points.rows(); ++i)
+                {
+                    const Eigen::Vector3d cp = control_points.row(i).transpose();
+                    if (options.meta_optimizer_collision_checker(cp))
+                    {
+                        collision_accum += 1.0;
+                        collision_peak = 1.0;
+                    }
+                    ++collision_span_count;
+                }
+                local_metrics.max_corridor_violation = collision_peak;
+            }
+
+            const double collision_cost =
+                collision_span_count > 0
+                    ? collision_accum /
+                              static_cast<double>(collision_span_count) +
+                          collision_peak * collision_peak
+                    : 0.0;
+
+            auto derivative_control_points =
+                [eps](const bsplinetrajectory::NUBSTrajectory<3> &trajectory,
+                      const int derivative_order,
+                      MatrixX3d &derivative_points) -> bool
+            {
+                derivative_points = trajectory.getControlPoints();
+                const Eigen::VectorXd &local_knots = trajectory.getKnots();
+                const int local_degree = trajectory.getP();
+                if (derivative_order <= 0)
+                {
+                    return derivative_points.allFinite();
+                }
+                if (derivative_order > local_degree)
+                {
+                    return false;
+                }
+
+                for (int derivative = 1;
+                     derivative <= derivative_order;
+                     ++derivative)
+                {
+                    const int rows = derivative_points.rows();
+                    if (rows <= 1)
+                    {
+                        return false;
+                    }
+
+                    MatrixX3d next(rows - 1, 3);
+                    const double scale =
+                        static_cast<double>(local_degree - derivative + 1);
+                    for (int i = 0; i < rows - 1; ++i)
+                    {
+                        const int knot_lo = i + derivative;
+                        const int knot_hi = i + local_degree + 1;
+                        if (knot_lo < 0 ||
+                            knot_hi >= local_knots.size())
+                        {
+                            return false;
+                        }
+                        const double denominator =
+                            local_knots(knot_hi) - local_knots(knot_lo);
+                        if (!std::isfinite(denominator) ||
+                            denominator <= eps)
+                        {
+                            return false;
+                        }
+                        next.row(i) =
+                            scale *
+                            (derivative_points.row(i + 1) -
+                             derivative_points.row(i)) /
+                            denominator;
+                    }
+                    derivative_points.swap(next);
+                }
+
+                return derivative_points.allFinite();
+            };
+
+            auto derivative_limit_cost =
+                [eps](const MatrixX3d &derivative_points,
+                      const double limit,
+                      double &peak_violation) -> double
+            {
+                peak_violation = 0.0;
+                if (derivative_points.rows() <= 0)
+                {
+                    return 0.0;
+                }
+
+                double violation_sum = 0.0;
+                for (int i = 0; i < derivative_points.rows(); ++i)
+                {
+                    const double violation =
+                        std::max(0.0,
+                                 derivative_points.row(i).norm() -
+                                     std::max(eps, limit));
+                    violation_sum += violation * violation;
+                    peak_violation = std::max(peak_violation, violation);
+                }
+                return violation_sum /
+                           static_cast<double>(derivative_points.rows()) +
+                       peak_violation * peak_violation;
+            };
+
+            MatrixX3d velocity_points;
+            MatrixX3d acceleration_points;
+            MatrixX3d jerk_points;
+            if (!derivative_control_points(candidate.trajectory, 1,
+                                           velocity_points) ||
+                !derivative_control_points(candidate.trajectory, 2,
+                                           acceleration_points))
+            {
+                if (metrics)
+                {
+                    *metrics = TrajectoryViolationMetrics();
+                }
+                return std::numeric_limits<double>::infinity();
+            }
+
+            const double velocity_cost =
+                derivative_limit_cost(velocity_points, simple_vel_max,
+                                      local_metrics.max_velocity_violation);
+            const double acceleration_cost =
+                derivative_limit_cost(acceleration_points, simple_acc_max,
+                                      local_metrics.max_acceleration_violation);
+
+            double jerk_cost = 0.0;
+            const double jerk_weight =
+                std::max(0.0, options.meta_optimizer_jerk_weight);
+            if (jerk_weight > 0.0)
+            {
+                if (!derivative_control_points(candidate.trajectory, 3,
+                                               jerk_points))
+                {
+                    if (metrics)
+                    {
+                        *metrics = TrajectoryViolationMetrics();
+                    }
+                    return std::numeric_limits<double>::infinity();
+                }
+                jerk_cost =
+                    derivative_limit_cost(
+                        jerk_points,
+                        std::max(eps, options.meta_optimizer_simple_max_jerk),
+                        local_metrics.max_jerk_violation);
+            }
+
+            const double time_cost =
+                std::max(0.0, options.meta_optimizer_time_weight) *
+                total_time;
+            const double energy_cost =
+                std::max(0.0, options.meta_optimizer_energy_weight) *
+                normalized_energy;
+            const double collision_penalty =
+                std::max(0.0, options.meta_optimizer_collision_weight) *
+                collision_cost;
+            const double velocity_penalty =
+                std::max(0.0, options.meta_optimizer_velocity_weight) *
+                velocity_cost;
+            const double acceleration_penalty =
+                std::max(0.0, options.meta_optimizer_acceleration_weight) *
+                acceleration_cost;
+            const double jerk_penalty = jerk_weight * jerk_cost;
+
+            local_metrics.penalty_cost =
+                collision_penalty + velocity_penalty +
+                acceleration_penalty + jerk_penalty;
+            local_metrics.sample_count =
+                control_points.rows() + velocity_points.rows() +
+                acceleration_points.rows() + jerk_points.rows();
+
+            if (metrics)
+            {
+                *metrics = local_metrics;
+            }
+
+            return time_cost + energy_cost + local_metrics.penalty_cost;
+        };
+
         auto direct_to_x =
-            [this, &unpack_direct, &build_direct_trajectory](const Eigen::VectorXd &y,
-                                                             Eigen::VectorXd &x) -> bool
+            [this, use_nubs_direct, &unpack_direct,
+             &build_direct_trajectory, &build_direct_nubs](
+                const Eigen::VectorXd &y,
+                Eigen::VectorXd &x) -> bool
         {
             Eigen::Matrix3Xd candidate_points;
             Eigen::VectorXd candidate_times;
@@ -791,14 +1305,26 @@ namespace gcopter
                 return false;
             }
 
-            minco::MINCO_S3NU direct_minco;
-            Trajectory<5> direct_traj;
             double trajectory_energy = 0.0;
-            if (!build_direct_trajectory(candidate_points, candidate_times,
-                                         direct_minco, direct_traj,
-                                         trajectory_energy))
+            Trajectory<5> direct_traj;
+            bsplinetrajectory::NUBSTrajectory<3> direct_nubs;
+            if (use_nubs_direct)
             {
-                return false;
+                if (!build_direct_nubs(candidate_points, candidate_times,
+                                       direct_nubs, trajectory_energy))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                minco::MINCO_S3NU direct_minco;
+                if (!build_direct_trajectory(candidate_points, candidate_times,
+                                             direct_minco, direct_traj,
+                                             trajectory_energy))
+                {
+                    return false;
+                }
             }
 
             const double total_time =
@@ -811,7 +1337,9 @@ namespace gcopter
                 const double t =
                     total_time * static_cast<double>(i + 1) /
                     static_cast<double>(pieceN);
-                lifted_points.col(i) = direct_traj.getPos(t);
+                lifted_points.col(i) =
+                    use_nubs_direct ? direct_nubs.evaluate(t, 0)
+                                    : direct_traj.getPos(t);
             }
 
             x.resize(getDecisionDim());
@@ -962,6 +1490,7 @@ namespace gcopter
         direct_optimizer_options.local_box_radius = local_box_radius;
         direct_optimizer.setWarmStartDecision(y0);
         const bool direct_optimizer_ready =
+            !use_nubs_direct &&
             direct_optimizer.setup(headPVA, tailPVA,
                                    anchor_points,
                                    workspace_min, workspace_max,
@@ -1057,8 +1586,11 @@ namespace gcopter
         };
 
         auto evaluate_direct_candidate =
-            [&unpack_direct, &build_direct_trajectory,
-             &evaluate_built_direct_candidate](
+            [use_nubs_direct, &unpack_direct,
+             &build_direct_trajectory, &build_direct_nubs,
+             &evaluate_built_direct_candidate,
+             &evaluate_simple_nubs_candidate,
+             &evaluate_control_point_nubs_candidate, &options](
                 const Eigen::VectorXd &candidate_y,
                 DirectCandidate &evaluated) -> bool
         {
@@ -1071,6 +1603,38 @@ namespace gcopter
                 evaluated.max_violation = std::numeric_limits<double>::infinity();
                 evaluated.feasible = false;
                 return false;
+            }
+
+            if (use_nubs_direct)
+            {
+                DirectNUBSCandidate candidate;
+                candidate.y = candidate_y;
+                candidate.points = candidate_points;
+                candidate.times = candidate_times;
+                if (!build_direct_nubs(candidate.points, candidate.times,
+                                       candidate.trajectory,
+                                       candidate.energy))
+                {
+                    evaluated.y = candidate_y;
+                    evaluated.cost = std::numeric_limits<double>::infinity();
+                    evaluated.max_violation = std::numeric_limits<double>::infinity();
+                    evaluated.feasible = false;
+                    return false;
+                }
+
+                TrajectoryViolationMetrics local_metrics;
+                evaluated.y = candidate_y;
+                evaluated.cost =
+                    options.meta_optimizer_use_control_point_objective
+                        ? evaluate_control_point_nubs_candidate(candidate,
+                                                                &local_metrics)
+                        : evaluate_simple_nubs_candidate(candidate,
+                                                         &local_metrics);
+                evaluated.max_violation = local_metrics.maxViolation();
+                evaluated.feasible =
+                    std::isfinite(evaluated.cost) &&
+                    evaluated.max_violation <= std::max(0.0, options.feasibility_tol);
+                return std::isfinite(evaluated.cost);
             }
 
             minco::MINCO_S3NU direct_minco;
@@ -1160,22 +1724,26 @@ namespace gcopter
 
         if (result.hit_time_budget)
         {
-            result.status = "MetaPlanner-style " + direct_mode_name +
+            result.status = "MetaPlanner-style " + direct_family_name +
+                            " " + direct_mode_name +
                             " IGO optimizer (wall-clock budget reached)";
         }
         else if (result.hit_eval_budget)
         {
-            result.status = "MetaPlanner-style " + direct_mode_name +
+            result.status = "MetaPlanner-style " + direct_family_name +
+                            " " + direct_mode_name +
                             " IGO optimizer (evaluation budget reached)";
         }
         else if (igoResult.converged)
         {
-            result.status = "MetaPlanner-style " + direct_mode_name +
+            result.status = "MetaPlanner-style " + direct_family_name +
+                            " " + direct_mode_name +
                             " IGO optimizer (converged)";
         }
         else
         {
-            result.status = "MetaPlanner-style " + direct_mode_name +
+            result.status = "MetaPlanner-style " + direct_family_name +
+                            " " + direct_mode_name +
                             " IGO optimizer";
         }
 
@@ -1210,33 +1778,72 @@ namespace gcopter
                 Eigen::VectorXd direct_times;
                 if (unpack_direct(best_direct->y, direct_points, direct_times))
                 {
-                    minco::MINCO_S3NU direct_minco;
-                    MINCOBlackboxOptimizerS3::Candidate final_candidate;
-                    final_candidate.y = best_direct->y;
-                    final_candidate.points = direct_points;
-                    final_candidate.times = direct_times;
-                    if (build_direct_trajectory(final_candidate.points,
-                                                final_candidate.times,
-                                                direct_minco,
-                                                final_candidate.trajectory,
-                                                final_candidate.energy))
+                    if (use_nubs_direct)
                     {
-                        result.objective =
-                            evaluate_simple_candidate(final_candidate,
-                                                      &result.violations,
-                                                      nullptr);
-                        if (std::isfinite(result.objective) &&
-                            final_candidate.trajectory.getPieceNum() > 0)
+                        DirectNUBSCandidate final_candidate;
+                        final_candidate.y = best_direct->y;
+                        final_candidate.points = direct_points;
+                        final_candidate.times = direct_times;
+                        if (build_direct_nubs(final_candidate.points,
+                                              final_candidate.times,
+                                              final_candidate.trajectory,
+                                              final_candidate.energy))
                         {
-                            result.has_solution = true;
-                            result.total_duration =
-                                final_candidate.trajectory.getTotalDuration();
-                            result.trajectory_length =
-                                approximateTrajectoryLength(final_candidate.trajectory,
-                                                            std::max(8, 4 * integralRes));
-                            result.has_meta_direct_solution = true;
-                            result.meta_direct_points = direct_points;
-                            result.meta_direct_times = direct_times;
+                            result.objective =
+                                options.meta_optimizer_use_control_point_objective
+                                    ? evaluate_control_point_nubs_candidate(
+                                          final_candidate,
+                                          &result.violations)
+                                    : evaluate_simple_nubs_candidate(
+                                          final_candidate,
+                                          &result.violations);
+                            if (std::isfinite(result.objective) &&
+                                final_candidate.trajectory.getPieceNum() > 0)
+                            {
+                                result.has_solution = true;
+                                result.total_duration =
+                                    final_candidate.trajectory.getTotalDuration();
+                                result.trajectory_length =
+                                    approximateNUBSTrajectoryLength(
+                                        final_candidate.trajectory,
+                                        std::max(8, 4 * integralRes));
+                                result.has_meta_direct_solution = true;
+                                result.has_meta_direct_nubs_solution = true;
+                                result.meta_direct_points = direct_points;
+                                result.meta_direct_times = direct_times;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        minco::MINCO_S3NU direct_minco;
+                        MINCOBlackboxOptimizerS3::Candidate final_candidate;
+                        final_candidate.y = best_direct->y;
+                        final_candidate.points = direct_points;
+                        final_candidate.times = direct_times;
+                        if (build_direct_trajectory(final_candidate.points,
+                                                    final_candidate.times,
+                                                    direct_minco,
+                                                    final_candidate.trajectory,
+                                                    final_candidate.energy))
+                        {
+                            result.objective =
+                                evaluate_simple_candidate(final_candidate,
+                                                          &result.violations,
+                                                          nullptr);
+                            if (std::isfinite(result.objective) &&
+                                final_candidate.trajectory.getPieceNum() > 0)
+                            {
+                                result.has_solution = true;
+                                result.total_duration =
+                                    final_candidate.trajectory.getTotalDuration();
+                                result.trajectory_length =
+                                    approximateTrajectoryLength(final_candidate.trajectory,
+                                                                std::max(8, 4 * integralRes));
+                                result.has_meta_direct_solution = true;
+                                result.meta_direct_points = direct_points;
+                                result.meta_direct_times = direct_times;
+                            }
                         }
                     }
                 }
@@ -1257,10 +1864,15 @@ namespace gcopter
                     approximateTrajectoryLength(local_traj, std::max(8, 4 * integralRes));
             }
         }
+        const std::string objective_name =
+            use_nubs_direct && options.meta_optimizer_use_control_point_objective
+                ? "control-point objective"
+                : "simple sampled objective";
         result.status = result.status + " [fixed " +
                         std::to_string(point_count) +
-                        "-midpoint direct " + direct_mode_name +
-                        " clearance cost]";
+                        "-midpoint direct " + direct_family_name +
+                        " " + direct_mode_name + " " +
+                        objective_name + "]";
         return result;
     }
 
@@ -1273,6 +1885,8 @@ namespace gcopter
         {
             SolverResult summary;
             Trajectory<5> trajectory;
+            bsplinetrajectory::NUBSTrajectory<3> nubs_trajectory;
+            bool has_nubs_trajectory = false;
         };
 
     public:
@@ -1284,16 +1898,24 @@ namespace gcopter
             result.summary = solver.solveMetaOptimizer(initial_x, options);
             if (result.summary.has_solution)
             {
-                minco::MINCO_S3NU direct_minco;
-                if (solver.buildMetaDirectJerkOpt(result.summary, direct_minco))
+                if (solver.buildMetaDirectNUBSTrajectory(result.summary,
+                                                         result.nubs_trajectory))
                 {
-                    direct_minco.getTrajectory(result.trajectory);
+                    result.has_nubs_trajectory = true;
                 }
                 else
                 {
-                    solver.evaluateObjectiveOnly(result.summary.best_x,
-                                                 nullptr,
-                                                 &result.trajectory);
+                    minco::MINCO_S3NU direct_minco;
+                    if (solver.buildMetaDirectJerkOpt(result.summary, direct_minco))
+                    {
+                        direct_minco.getTrajectory(result.trajectory);
+                    }
+                    else
+                    {
+                        solver.evaluateObjectiveOnly(result.summary.best_x,
+                                                     nullptr,
+                                                     &result.trajectory);
+                    }
                 }
             }
             return result;

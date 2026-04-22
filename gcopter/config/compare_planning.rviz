@@ -182,7 +182,7 @@ Visualization Manager:
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /visualizer_meta_pt/trajectory
-      Name: META_PT Trajectory
+      Name: NUBS_META_PT Trajectory
       Namespaces:
         trajectory: true
       Queue Size: 100
@@ -190,7 +190,7 @@ Visualization Manager:
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /visualizer_meta_pt/spheres
-      Name: META_PT Maker
+      Name: NUBS_META_PT Maker
       Namespaces:
         spheres: true
       Queue Size: 100

@@ -35,3 +35,7 @@
 \compare_outputs    
 
 \benchmark_runs
+
+\nubs_outputs
+
+gcopter/script/nubs_outputs/*.csv

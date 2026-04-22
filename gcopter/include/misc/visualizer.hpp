@@ -2,6 +2,7 @@
 #define VISUALIZER_HPP
 
 #include "gcopter/trajectory.hpp"
+#include "gcopter/bspline_trajectory.hpp"
 #include "gcopter/quickhull.hpp"
 #include "gcopter/geo_utils.hpp"
 
@@ -224,9 +225,72 @@ public:
         }
     }
 
+    inline void visualizeTrajectory(const bsplinetrajectory::NUBSTrajectory<3> &traj)
+    {
+        visualization_msgs::Marker controlPointsMarker, trajMarker;
+
+        controlPointsMarker.id = 1;
+        controlPointsMarker.type = visualization_msgs::Marker::SPHERE_LIST;
+        controlPointsMarker.header.stamp = ros::Time::now();
+        controlPointsMarker.header.frame_id = "odom";
+        controlPointsMarker.pose.orientation.w = 1.00;
+        controlPointsMarker.action = visualization_msgs::Marker::ADD;
+        controlPointsMarker.ns = "nubs_control_points";
+        applyColor(controlPointsMarker, Color{0.0, 0.65, 1.0, 1.0});
+        controlPointsMarker.scale.x = style.waypointScale;
+        controlPointsMarker.scale.y = style.waypointScale;
+        controlPointsMarker.scale.z = style.waypointScale;
+
+        trajMarker = controlPointsMarker;
+        trajMarker.id = 1;
+        trajMarker.type = visualization_msgs::Marker::LINE_LIST;
+        trajMarker.ns = "nubs_trajectory";
+        applyColor(trajMarker, Color{0.0, 0.85, 1.0, 1.0});
+        trajMarker.scale.x = style.trajectoryWidth;
+
+        if (traj.getPieceNum() > 0)
+        {
+            const auto &control_points = traj.getControlPoints();
+            for (int i = 0; i < control_points.rows(); ++i)
+            {
+                geometry_msgs::Point point;
+                point.x = control_points(i, 0);
+                point.y = control_points(i, 1);
+                point.z = control_points(i, 2);
+                controlPointsMarker.points.push_back(point);
+            }
+            wayPointsPub.publish(controlPointsMarker);
+
+            const double sample_dt = 0.01;
+            Eigen::Vector3d lastX = traj.evaluate(0.0, 0);
+            for (double t = sample_dt; t < traj.getTotalDuration(); t += sample_dt)
+            {
+                geometry_msgs::Point point;
+                const Eigen::Vector3d X = traj.evaluate(t, 0);
+                point.x = lastX(0);
+                point.y = lastX(1);
+                point.z = lastX(2);
+                trajMarker.points.push_back(point);
+                point.x = X(0);
+                point.y = X(1);
+                point.z = X(2);
+                trajMarker.points.push_back(point);
+                lastX = X;
+            }
+            trajectoryPub.publish(trajMarker);
+        }
+    }
+
     // Visualize the trajectory and its front-end path
     template <int D>
     inline void visualize(const Trajectory<D> &traj,
+                          const std::vector<Eigen::Vector3d> &route)
+    {
+        visualizeRoute(route);
+        visualizeTrajectory(traj);
+    }
+
+    inline void visualize(const bsplinetrajectory::NUBSTrajectory<3> &traj,
                           const std::vector<Eigen::Vector3d> &route)
     {
         visualizeRoute(route);
@@ -330,6 +394,36 @@ public:
         sphereMarkers.action = visualization_msgs::Marker::ADD;
         sphereMarkers.ns = "spheres";
         applyColor(sphereMarkers, style.sphereColor);
+        sphereMarkers.scale.x = radius * 2.0;
+        sphereMarkers.scale.y = radius * 2.0;
+        sphereMarkers.scale.z = radius * 2.0;
+
+        sphereDeleter = sphereMarkers;
+        sphereDeleter.action = visualization_msgs::Marker::DELETE;
+
+        geometry_msgs::Point point;
+        point.x = center(0);
+        point.y = center(1);
+        point.z = center(2);
+        sphereMarkers.points.push_back(point);
+
+        spherePub.publish(sphereDeleter);
+        spherePub.publish(sphereMarkers);
+    }
+
+    inline void visualizeNUBSSphere(const Eigen::Vector3d &center,
+                                    const double &radius)
+    {
+        visualization_msgs::Marker sphereMarkers, sphereDeleter;
+
+        sphereMarkers.id = 1;
+        sphereMarkers.type = visualization_msgs::Marker::SPHERE_LIST;
+        sphereMarkers.header.stamp = ros::Time::now();
+        sphereMarkers.header.frame_id = "odom";
+        sphereMarkers.pose.orientation.w = 1.00;
+        sphereMarkers.action = visualization_msgs::Marker::ADD;
+        sphereMarkers.ns = "nubs_spheres";
+        applyColor(sphereMarkers, Color{0.0, 0.85, 1.0, 1.0});
         sphereMarkers.scale.x = radius * 2.0;
         sphereMarkers.scale.y = radius * 2.0;
         sphereMarkers.scale.z = radius * 2.0;

@@ -26,6 +26,7 @@
 #define GCOPTER_HPP
 
 #include "gcopter/igo.hpp"
+#include "gcopter/bspline_trajectory.hpp"
 #include "gcopter/minco.hpp"
 #include "gcopter/flatness.hpp"
 #include "gcopter/geo_utils.hpp"
@@ -61,6 +62,7 @@ namespace gcopter
             double max_corridor_violation = 0.0;
             double max_velocity_violation = 0.0;
             double max_acceleration_violation = 0.0;
+            double max_jerk_violation = 0.0;
             double max_body_rate_violation = 0.0;
             double max_tilt_violation = 0.0;
             double max_thrust_violation = 0.0;
@@ -68,9 +70,11 @@ namespace gcopter
 
             inline double maxViolation() const
             {
-                return std::max(std::max(std::max(max_corridor_violation, max_velocity_violation),
-                                         std::max(max_acceleration_violation, max_body_rate_violation)),
-                                std::max(max_tilt_violation, max_thrust_violation));
+                return std::max(
+                    std::max(std::max(max_corridor_violation, max_velocity_violation),
+                             std::max(max_acceleration_violation, max_jerk_violation)),
+                    std::max(std::max(max_body_rate_violation, max_tilt_violation),
+                             max_thrust_violation));
             }
         };
 
@@ -127,10 +131,14 @@ namespace gcopter
             double meta_optimizer_time_ub = 8.0;
             double meta_optimizer_simple_max_velocity = 4.0;
             double meta_optimizer_simple_max_acceleration = 15.0;
+            double meta_optimizer_simple_max_jerk = 50.0;
             double meta_optimizer_target_velocity_ratio = 0.90;
             double meta_optimizer_local_box_radius = 2.0;
             bool meta_optimizer_use_time_profile = true;
+            bool meta_optimizer_use_nubs_direct = false;
+            bool meta_optimizer_use_control_point_objective = false;
             bool meta_optimizer_use_collision_length_cost = true;
+            double meta_optimizer_jerk_weight = 0.0;
             bool meta_optimizer_has_workspace_bounds = false;
             Eigen::Vector3d meta_optimizer_workspace_min = Eigen::Vector3d::Zero();
             Eigen::Vector3d meta_optimizer_workspace_max = Eigen::Vector3d::Zero();
@@ -143,6 +151,14 @@ namespace gcopter
 
         struct SolverResult
         {
+            struct EvaluationBreakdown
+            {
+                double generate_time = 0.0;
+                double coeff_grad_time = 0.0;
+                double time_grad_time = 0.0;
+                double propagate_time = 0.0;
+            };
+
             bool has_solution = false;
             bool converged = false;
             bool hit_eval_budget = false;
@@ -151,11 +167,14 @@ namespace gcopter
             int iterations = 0;
             int eval_count = 0;
             double wall_time = 0.0;
+            double evaluation_time = 0.0;
+            EvaluationBreakdown evaluation_breakdown;
             double objective = std::numeric_limits<double>::infinity();
             double total_duration = std::numeric_limits<double>::infinity();
             double trajectory_length = std::numeric_limits<double>::infinity();
             Eigen::VectorXd best_x;
             bool has_meta_direct_solution = false;
+            bool has_meta_direct_nubs_solution = false;
             Eigen::Matrix3Xd meta_direct_points;
             Eigen::VectorXd meta_direct_times;
             TrajectoryViolationMetrics violations;
@@ -184,6 +203,8 @@ namespace gcopter
             std::chrono::steady_clock::time_point start_time;
             Eigen::VectorXd best_x;
             double best_cost = std::numeric_limits<double>::infinity();
+            double evaluation_time = 0.0;
+            SolverResult::EvaluationBreakdown evaluation_breakdown;
             int eval_count = 0;
             int iterations = 0;
             bool hit_eval_budget = false;
@@ -191,6 +212,7 @@ namespace gcopter
         };
 
         minco::MINCO_S3NU minco;
+        bsplinetrajectory::NUBSTrajectory<3> nubs;
         flatness::FlatnessMap flatmap;
 
         double rho;
@@ -233,6 +255,12 @@ namespace gcopter
         Eigen::VectorXd gradByTimes;
         Eigen::MatrixX3d partialGradByCoeffs;
         Eigen::VectorXd partialGradByTimes;
+
+        Eigen::MatrixXd nubsControlPoints;
+        Eigen::MatrixXd nubsGradByCoeffs;
+        Eigen::MatrixXd nubsGradByPoints;
+        Eigen::VectorXd nubsGradByTimesDirect;
+        Eigen::VectorXd nubsGradByTimes;
 
     private:
         static inline double positiveEps()
@@ -1027,6 +1055,37 @@ namespace gcopter
             return length;
         }
 
+        static inline double approximateNUBSTrajectoryLength(
+            const bsplinetrajectory::NUBSTrajectory<3> &traj,
+            const int samplePerPiece)
+        {
+            if (traj.getPieceNum() <= 0)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            const int samples = std::max(2, samplePerPiece * traj.getPieceNum());
+            const double total_duration = traj.getTotalDuration();
+            if (!std::isfinite(total_duration) || total_duration <= 0.0)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            double length = 0.0;
+            Eigen::Vector3d previous = traj.evaluate(0.0, 0);
+            for (int i = 1; i <= samples; ++i)
+            {
+                const double t =
+                    total_duration * static_cast<double>(i) /
+                    static_cast<double>(samples);
+                const Eigen::Vector3d current = traj.evaluate(t, 0);
+                length += (current - previous).norm();
+                previous = current;
+            }
+
+            return length;
+        }
+
         static inline double budgetedCostFunctional(void *ptr,
                                                     const Eigen::VectorXd &x,
                                                     Eigen::VectorXd &g)
@@ -1049,7 +1108,117 @@ namespace gcopter
                 }
             }
 
+            const auto eval_start = std::chrono::steady_clock::now();
             const double cost = costFunctional(ctx.solver, x, g);
+            ctx.evaluation_time +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - eval_start).count();
+            ++ctx.eval_count;
+            if (std::isfinite(cost) && cost < ctx.best_cost)
+            {
+                ctx.best_cost = cost;
+                ctx.best_x = x;
+            }
+            return cost;
+        }
+
+        static inline double budgetedNUBSCostFunctional(void *ptr,
+                                                        const Eigen::VectorXd &x,
+                                                        Eigen::VectorXd &g)
+        {
+            LBFGSSolveContext &ctx = *(LBFGSSolveContext *)ptr;
+            if (ctx.options.max_evaluations > 0 && ctx.eval_count >= ctx.options.max_evaluations)
+            {
+                ctx.hit_eval_budget = true;
+                throw BudgetExceededException("evaluation budget reached");
+            }
+
+            if (ctx.options.max_wall_time > 0.0)
+            {
+                const std::chrono::duration<double> elapsed =
+                    std::chrono::steady_clock::now() - ctx.start_time;
+                if (elapsed.count() >= ctx.options.max_wall_time)
+                {
+                    ctx.hit_time_budget = true;
+                    throw BudgetExceededException("wall-clock budget reached");
+                }
+            }
+
+            const auto eval_start = std::chrono::steady_clock::now();
+            const double cost =
+                costFunctionalNUBS(ctx.solver, x, g, &ctx.evaluation_breakdown);
+            ctx.evaluation_time +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - eval_start).count();
+            ++ctx.eval_count;
+            if (std::isfinite(cost) && cost < ctx.best_cost)
+            {
+                ctx.best_cost = cost;
+                ctx.best_x = x;
+            }
+            return cost;
+        }
+
+        static inline double budgetedNUBSFiniteDiffCostFunctional(void *ptr,
+                                                                  const Eigen::VectorXd &x,
+                                                                  Eigen::VectorXd &g)
+        {
+            LBFGSSolveContext &ctx = *(LBFGSSolveContext *)ptr;
+            if (ctx.options.max_evaluations > 0 && ctx.eval_count >= ctx.options.max_evaluations)
+            {
+                ctx.hit_eval_budget = true;
+                throw BudgetExceededException("evaluation budget reached");
+            }
+
+            if (ctx.options.max_wall_time > 0.0)
+            {
+                const std::chrono::duration<double> elapsed =
+                    std::chrono::steady_clock::now() - ctx.start_time;
+                if (elapsed.count() >= ctx.options.max_wall_time)
+                {
+                    ctx.hit_time_budget = true;
+                    throw BudgetExceededException("wall-clock budget reached");
+                }
+            }
+
+            const auto eval_start = std::chrono::steady_clock::now();
+            const double cost =
+                costFunctionalNUBSFiniteDiff(ctx.solver, x, g, &ctx.evaluation_breakdown);
+            ctx.evaluation_time +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - eval_start).count();
+            ++ctx.eval_count;
+            if (std::isfinite(cost) && cost < ctx.best_cost)
+            {
+                ctx.best_cost = cost;
+                ctx.best_x = x;
+            }
+            return cost;
+        }
+
+        static inline double budgetedMINCOEnergyCostFunctional(void *ptr,
+                                                               const Eigen::VectorXd &x,
+                                                               Eigen::VectorXd &g)
+        {
+            LBFGSSolveContext &ctx = *(LBFGSSolveContext *)ptr;
+            if (ctx.options.max_evaluations > 0 && ctx.eval_count >= ctx.options.max_evaluations)
+            {
+                ctx.hit_eval_budget = true;
+                throw BudgetExceededException("evaluation budget reached");
+            }
+
+            if (ctx.options.max_wall_time > 0.0)
+            {
+                const std::chrono::duration<double> elapsed =
+                    std::chrono::steady_clock::now() - ctx.start_time;
+                if (elapsed.count() >= ctx.options.max_wall_time)
+                {
+                    ctx.hit_time_budget = true;
+                    throw BudgetExceededException("wall-clock budget reached");
+                }
+            }
+
+            const auto eval_start = std::chrono::steady_clock::now();
+            const double cost = costFunctionalMINCOEnergy(ctx.solver, x, g);
+            ctx.evaluation_time +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - eval_start).count();
             ++ctx.eval_count;
             if (std::isfinite(cost) && cost < ctx.best_cost)
             {
@@ -1114,6 +1283,222 @@ namespace gcopter
             backwardGradT(tau, obj.gradByTimes, gradTau);
             backwardGradP(xi, obj.vPolyIdx, obj.vPolytopes, obj.gradByPoints, gradXi);
             normRetrictionLayer(xi, obj.vPolyIdx, obj.vPolytopes, cost, gradXi);
+
+            return cost;
+        }
+
+        static inline double costFunctionalNUBS(
+            void *ptr,
+            const Eigen::VectorXd &x,
+            Eigen::VectorXd &g,
+            SolverResult::EvaluationBreakdown *timing = nullptr)
+        {
+            GCOPTER_PolytopeSFC &obj = *(GCOPTER_PolytopeSFC *)ptr;
+            const int dimTau = obj.temporalDim;
+            const int dimXi = obj.spatialDim;
+            const double weightT = obj.rho;
+            const auto generate_start = std::chrono::steady_clock::now();
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
+            Eigen::Map<Eigen::VectorXd> gradTau(g.data(), dimTau);
+            Eigen::Map<Eigen::VectorXd> gradXi(g.data() + dimTau, dimXi);
+
+            forwardT(tau, obj.times);
+            forwardP(xi, obj.vPolyIdx, obj.vPolytopes, obj.points);
+
+            Eigen::MatrixXd innerPointsRows =
+                obj.points.cols() > 0 ? obj.points.transpose()
+                                      : Eigen::MatrixXd(0, 3);
+            double cost = 0.0;
+            obj.nubs.generate(innerPointsRows, obj.headPVA, obj.tailPVA,
+                              obj.times, obj.nubsControlPoints);
+            if (timing)
+            {
+                timing->generate_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - generate_start)
+                        .count();
+            }
+
+            const auto coeff_grad_start = std::chrono::steady_clock::now();
+            obj.nubs.getEnergyPartialGradByCoeffs(cost, obj.nubsGradByCoeffs);
+            if (timing)
+            {
+                timing->coeff_grad_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - coeff_grad_start)
+                        .count();
+            }
+
+            const auto time_grad_start = std::chrono::steady_clock::now();
+            obj.nubs.getEnergyPartialGradByTimesAnalytic(obj.nubsGradByTimesDirect);
+            if (timing)
+            {
+                timing->time_grad_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - time_grad_start)
+                        .count();
+            }
+
+            const auto propagate_start = std::chrono::steady_clock::now();
+            obj.nubs.propagateGradAnalytic(obj.nubsGradByCoeffs,
+                                           obj.nubsGradByTimesDirect,
+                                           obj.nubsGradByPoints,
+                                           obj.nubsGradByTimes);
+
+            cost += weightT * obj.times.sum();
+            obj.nubsGradByTimes.array() += weightT;
+
+            Eigen::Matrix3Xd gradByPointsCols(3, std::max(0, obj.pieceN - 1));
+            if (obj.nubsGradByPoints.rows() > 0)
+            {
+                gradByPointsCols = obj.nubsGradByPoints.transpose();
+            }
+            else
+            {
+                gradByPointsCols.resize(3, 0);
+            }
+
+            backwardGradT(tau, obj.nubsGradByTimes, gradTau);
+            backwardGradP(xi, obj.vPolyIdx, obj.vPolytopes,
+                          gradByPointsCols, gradXi);
+            normRetrictionLayer(xi, obj.vPolyIdx, obj.vPolytopes,
+                                cost, gradXi);
+            if (timing)
+            {
+                timing->propagate_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - propagate_start)
+                        .count();
+            }
+
+            return cost;
+        }
+
+        static inline double costFunctionalNUBSFiniteDiff(
+            void *ptr,
+            const Eigen::VectorXd &x,
+            Eigen::VectorXd &g,
+            SolverResult::EvaluationBreakdown *timing = nullptr)
+        {
+            GCOPTER_PolytopeSFC &obj = *(GCOPTER_PolytopeSFC *)ptr;
+            const int dimTau = obj.temporalDim;
+            const int dimXi = obj.spatialDim;
+            const double weightT = obj.rho;
+            const auto generate_start = std::chrono::steady_clock::now();
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
+            Eigen::Map<Eigen::VectorXd> gradTau(g.data(), dimTau);
+            Eigen::Map<Eigen::VectorXd> gradXi(g.data() + dimTau, dimXi);
+
+            forwardT(tau, obj.times);
+            forwardP(xi, obj.vPolyIdx, obj.vPolytopes, obj.points);
+
+            const Eigen::MatrixXd innerPointsRows =
+                obj.points.cols() > 0 ? obj.points.transpose()
+                                      : Eigen::MatrixXd(0, 3);
+            double cost = 0.0;
+            obj.nubs.generate(innerPointsRows, obj.headPVA, obj.tailPVA,
+                              obj.times, obj.nubsControlPoints);
+            if (timing)
+            {
+                timing->generate_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - generate_start)
+                        .count();
+            }
+
+            const auto coeff_grad_start = std::chrono::steady_clock::now();
+            obj.nubs.getEnergyPartialGradByCoeffs(cost, obj.nubsGradByCoeffs);
+            if (timing)
+            {
+                timing->coeff_grad_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - coeff_grad_start)
+                        .count();
+            }
+
+            const auto time_grad_start = std::chrono::steady_clock::now();
+            obj.nubs.getEnergyPartialGradByTimesFiniteDiff(obj.times,
+                                                           obj.nubsGradByTimesDirect);
+            if (timing)
+            {
+                timing->time_grad_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - time_grad_start)
+                        .count();
+            }
+
+            const auto propagate_start = std::chrono::steady_clock::now();
+            obj.nubs.propagateGradFiniteDiff(obj.nubsGradByCoeffs,
+                                             obj.nubsGradByTimesDirect,
+                                             obj.times,
+                                             obj.nubsGradByPoints,
+                                             obj.nubsGradByTimes);
+
+            cost += weightT * obj.times.sum();
+            obj.nubsGradByTimes.array() += weightT;
+
+            Eigen::Matrix3Xd gradByPointsCols(3, std::max(0, obj.pieceN - 1));
+            if (obj.nubsGradByPoints.rows() > 0)
+            {
+                gradByPointsCols = obj.nubsGradByPoints.transpose();
+            }
+            else
+            {
+                gradByPointsCols.resize(3, 0);
+            }
+
+            backwardGradT(tau, obj.nubsGradByTimes, gradTau);
+            backwardGradP(xi, obj.vPolyIdx, obj.vPolytopes,
+                          gradByPointsCols, gradXi);
+            normRetrictionLayer(xi, obj.vPolyIdx, obj.vPolytopes,
+                                cost, gradXi);
+            if (timing)
+            {
+                timing->propagate_time +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - propagate_start)
+                        .count();
+            }
+
+            return cost;
+        }
+
+        static inline double costFunctionalMINCOEnergy(void *ptr,
+                                                       const Eigen::VectorXd &x,
+                                                       Eigen::VectorXd &g)
+        {
+            GCOPTER_PolytopeSFC &obj = *(GCOPTER_PolytopeSFC *)ptr;
+            const int dimTau = obj.temporalDim;
+            const int dimXi = obj.spatialDim;
+            const double weightT = obj.rho;
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
+            Eigen::Map<Eigen::VectorXd> gradTau(g.data(), dimTau);
+            Eigen::Map<Eigen::VectorXd> gradXi(g.data() + dimTau, dimXi);
+
+            forwardT(tau, obj.times);
+            forwardP(xi, obj.vPolyIdx, obj.vPolytopes, obj.points);
+
+            double cost = 0.0;
+            obj.minco.setParameters(obj.points, obj.times);
+            obj.minco.getEnergy(cost);
+            obj.minco.getEnergyPartialGradByCoeffs(obj.partialGradByCoeffs);
+            obj.minco.getEnergyPartialGradByTimes(obj.partialGradByTimes);
+            obj.minco.propogateGrad(obj.partialGradByCoeffs,
+                                    obj.partialGradByTimes,
+                                    obj.gradByPoints,
+                                    obj.gradByTimes);
+
+            cost += weightT * obj.times.sum();
+            obj.gradByTimes.array() += weightT;
+
+            backwardGradT(tau, obj.gradByTimes, gradTau);
+            backwardGradP(xi, obj.vPolyIdx, obj.vPolytopes,
+                          obj.gradByPoints, gradXi);
+            normRetrictionLayer(xi, obj.vPolyIdx, obj.vPolytopes,
+                                cost, gradXi);
 
             return cost;
         }
@@ -1864,10 +2249,45 @@ namespace gcopter
             return true;
         }
 
+        inline bool buildNUBSTrajectory(const Eigen::VectorXd &x,
+                                        bsplinetrajectory::NUBSTrajectory<3> &nubsTraj) const
+        {
+            if (x.size() != getDecisionDim() || pieceN <= 0)
+            {
+                return false;
+            }
+
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), temporalDim);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + temporalDim, spatialDim);
+
+            Eigen::VectorXd candidate_times;
+            Eigen::Matrix3Xd candidate_points;
+            forwardT(tau, candidate_times);
+            forwardP(xi, vPolyIdx, vPolytopes, candidate_points);
+
+            if (candidate_times.size() != pieceN ||
+                candidate_points.cols() != pieceN - 1 ||
+                !candidate_times.allFinite() ||
+                !candidate_points.allFinite() ||
+                (candidate_times.array() <= positiveEps()).any())
+            {
+                return false;
+            }
+
+            Eigen::MatrixXd control_points;
+            const Eigen::MatrixXd inner_points_rows =
+                candidate_points.cols() > 0 ? candidate_points.transpose()
+                                            : Eigen::MatrixXd(0, 3);
+            nubsTraj.generate(inner_points_rows, headPVA, tailPVA,
+                              candidate_times, control_points);
+            return true;
+        }
+
         inline bool buildMetaDirectJerkOpt(const SolverResult &result,
                                            minco::MINCO_S3NU &jerkOpt) const
         {
             if (!result.has_meta_direct_solution ||
+                result.has_meta_direct_nubs_solution ||
                 result.meta_direct_times.size() <= 0 ||
                 result.meta_direct_points.cols() != result.meta_direct_times.size() - 1 ||
                 !result.meta_direct_times.allFinite() ||
@@ -1882,6 +2302,38 @@ namespace gcopter
             jerkOpt.setParameters(result.meta_direct_points,
                                   result.meta_direct_times);
             return true;
+        }
+
+        inline bool buildMetaDirectNUBSTrajectory(
+            const SolverResult &result,
+            bsplinetrajectory::NUBSTrajectory<3> &nubsTraj) const
+        {
+            if (!result.has_meta_direct_solution ||
+                !result.has_meta_direct_nubs_solution ||
+                result.meta_direct_times.size() <= 0 ||
+                result.meta_direct_points.cols() != result.meta_direct_times.size() - 1 ||
+                !result.meta_direct_times.allFinite() ||
+                !result.meta_direct_points.allFinite() ||
+                (result.meta_direct_times.array() <= positiveEps()).any())
+            {
+                return false;
+            }
+
+            Eigen::MatrixXd control_points;
+            const Eigen::MatrixXd inner_points_rows =
+                result.meta_direct_points.cols() > 0
+                    ? result.meta_direct_points.transpose()
+                    : Eigen::MatrixXd(0, 3);
+            try
+            {
+                nubsTraj.generate(inner_points_rows, headPVA, tailPVA,
+                                  result.meta_direct_times, control_points);
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+            return nubsTraj.getPieceNum() > 0;
         }
 
         inline SolverResult solveLBFGS(const Eigen::VectorXd &initialX,
@@ -1933,6 +2385,8 @@ namespace gcopter
             result.solver_status = ret;
             result.iterations = ctx.iterations;
             result.eval_count = ctx.eval_count;
+            result.evaluation_time = ctx.evaluation_time;
+            result.evaluation_breakdown = ctx.evaluation_breakdown;
             result.hit_eval_budget = ctx.hit_eval_budget;
             result.hit_time_budget = ctx.hit_time_budget;
             result.converged = (ret == lbfgs::LBFGS_CONVERGENCE || ret == lbfgs::LBFGS_STOP);
@@ -1982,6 +2436,287 @@ namespace gcopter
         inline SolverResult solveLBFGSOriginal(const double relCostTol)
         {
             return solveLBFGSOriginal(getCommonInitialGuess(), relCostTol);
+        }
+
+        inline SolverResult solveNUBSLBFGS(const Eigen::VectorXd &initialX,
+                                           const LBFGSSolveOptions &options)
+        {
+            SolverResult result;
+            Eigen::VectorXd x;
+            if (initialX.size() == getDecisionDim())
+            {
+                x = initialX;
+            }
+            else
+            {
+                x = getCommonInitialGuess();
+            }
+
+            LBFGSSolveContext ctx;
+            ctx.solver = this;
+            ctx.options = options;
+            ctx.start_time = std::chrono::steady_clock::now();
+            ctx.best_x = x;
+
+            double minCostFunctional = std::numeric_limits<double>::infinity();
+            lbfgs_params.mem_size = options.mem_size;
+            lbfgs_params.past = options.past;
+            lbfgs_params.min_step = 1.0e-32;
+            lbfgs_params.g_epsilon = 0.0;
+            lbfgs_params.delta = options.rel_cost_tol;
+            lbfgs_params.max_iterations = options.max_iterations;
+
+            int ret = lbfgs::LBFGS_CANCELED;
+            try
+            {
+                ret = lbfgs::lbfgs_optimize(x,
+                                            minCostFunctional,
+                                            &GCOPTER_PolytopeSFC::budgetedNUBSCostFunctional,
+                                            nullptr,
+                                            &GCOPTER_PolytopeSFC::budgetedLBFGSProgress,
+                                            &ctx,
+                                            lbfgs_params);
+            }
+            catch (const BudgetExceededException &)
+            {
+                ret = lbfgs::LBFGS_CANCELED;
+            }
+
+            result.wall_time =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx.start_time).count();
+            result.solver_status = ret;
+            result.iterations = ctx.iterations;
+            result.eval_count = ctx.eval_count;
+            result.evaluation_time = ctx.evaluation_time;
+            result.evaluation_breakdown = ctx.evaluation_breakdown;
+            result.hit_eval_budget = ctx.hit_eval_budget;
+            result.hit_time_budget = ctx.hit_time_budget;
+            result.converged = (ret == lbfgs::LBFGS_CONVERGENCE || ret == lbfgs::LBFGS_STOP);
+
+            if (ctx.hit_time_budget)
+            {
+                result.status = "NUBS LBFGS wall-clock budget reached";
+            }
+            else if (ctx.hit_eval_budget)
+            {
+                result.status = "NUBS LBFGS evaluation budget reached";
+            }
+            else
+            {
+                result.status = std::string("NUBS LBFGS: ") + lbfgs::lbfgs_strerror(ret);
+            }
+
+            result.best_x = ctx.best_x.size() == getDecisionDim() ? ctx.best_x : x;
+
+            bsplinetrajectory::NUBSTrajectory<3> local_traj;
+            if (buildNUBSTrajectory(result.best_x, local_traj))
+            {
+                Eigen::VectorXd grad_dummy(getDecisionDim());
+                result.objective = costFunctionalNUBS(this, result.best_x, grad_dummy);
+                result.has_solution = std::isfinite(result.objective);
+                result.total_duration = local_traj.getTotalDuration();
+                result.trajectory_length =
+                    approximateNUBSTrajectoryLength(local_traj, std::max(8, 4 * integralRes));
+            }
+
+            return result;
+        }
+
+        inline SolverResult solveNUBSLBFGSOriginal(const Eigen::VectorXd &initialX,
+                                                   const double relCostTol)
+        {
+            LBFGSSolveOptions options;
+            options.rel_cost_tol = relCostTol;
+            return solveNUBSLBFGS(initialX, options);
+        }
+
+        inline SolverResult solveNUBSFiniteDiffLBFGS(const Eigen::VectorXd &initialX,
+                                                     const LBFGSSolveOptions &options)
+        {
+            SolverResult result;
+            Eigen::VectorXd x;
+            if (initialX.size() == getDecisionDim())
+            {
+                x = initialX;
+            }
+            else
+            {
+                x = getCommonInitialGuess();
+            }
+
+            LBFGSSolveContext ctx;
+            ctx.solver = this;
+            ctx.options = options;
+            ctx.start_time = std::chrono::steady_clock::now();
+            ctx.best_x = x;
+
+            double minCostFunctional = std::numeric_limits<double>::infinity();
+            lbfgs_params.mem_size = options.mem_size;
+            lbfgs_params.past = options.past;
+            lbfgs_params.min_step = 1.0e-32;
+            lbfgs_params.g_epsilon = 0.0;
+            lbfgs_params.delta = options.rel_cost_tol;
+            lbfgs_params.max_iterations = options.max_iterations;
+
+            int ret = lbfgs::LBFGS_CANCELED;
+            try
+            {
+                ret = lbfgs::lbfgs_optimize(
+                    x,
+                    minCostFunctional,
+                    &GCOPTER_PolytopeSFC::budgetedNUBSFiniteDiffCostFunctional,
+                    nullptr,
+                    &GCOPTER_PolytopeSFC::budgetedLBFGSProgress,
+                    &ctx,
+                    lbfgs_params);
+            }
+            catch (const BudgetExceededException &)
+            {
+                ret = lbfgs::LBFGS_CANCELED;
+            }
+
+            result.wall_time =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx.start_time).count();
+            result.solver_status = ret;
+            result.iterations = ctx.iterations;
+            result.eval_count = ctx.eval_count;
+            result.evaluation_time = ctx.evaluation_time;
+            result.evaluation_breakdown = ctx.evaluation_breakdown;
+            result.hit_eval_budget = ctx.hit_eval_budget;
+            result.hit_time_budget = ctx.hit_time_budget;
+            result.converged = (ret == lbfgs::LBFGS_CONVERGENCE || ret == lbfgs::LBFGS_STOP);
+
+            if (ctx.hit_time_budget)
+            {
+                result.status = "NUBS finite-diff LBFGS wall-clock budget reached";
+            }
+            else if (ctx.hit_eval_budget)
+            {
+                result.status = "NUBS finite-diff LBFGS evaluation budget reached";
+            }
+            else
+            {
+                result.status = std::string("NUBS finite-diff LBFGS: ") +
+                                lbfgs::lbfgs_strerror(ret);
+            }
+
+            result.best_x = ctx.best_x.size() == getDecisionDim() ? ctx.best_x : x;
+
+            bsplinetrajectory::NUBSTrajectory<3> local_traj;
+            if (buildNUBSTrajectory(result.best_x, local_traj))
+            {
+                Eigen::VectorXd grad_dummy(getDecisionDim());
+                result.objective =
+                    costFunctionalNUBSFiniteDiff(this, result.best_x, grad_dummy);
+                result.has_solution = std::isfinite(result.objective);
+                result.total_duration = local_traj.getTotalDuration();
+                result.trajectory_length =
+                    approximateNUBSTrajectoryLength(local_traj, std::max(8, 4 * integralRes));
+            }
+
+            return result;
+        }
+
+        inline SolverResult solveNUBSFiniteDiffLBFGSOriginal(
+            const Eigen::VectorXd &initialX,
+            const double relCostTol)
+        {
+            LBFGSSolveOptions options;
+            options.rel_cost_tol = relCostTol;
+            return solveNUBSFiniteDiffLBFGS(initialX, options);
+        }
+
+        inline SolverResult solveMINCOEnergyLBFGS(const Eigen::VectorXd &initialX,
+                                                  const LBFGSSolveOptions &options)
+        {
+            SolverResult result;
+            Eigen::VectorXd x;
+            if (initialX.size() == getDecisionDim())
+            {
+                x = initialX;
+            }
+            else
+            {
+                x = getCommonInitialGuess();
+            }
+
+            LBFGSSolveContext ctx;
+            ctx.solver = this;
+            ctx.options = options;
+            ctx.start_time = std::chrono::steady_clock::now();
+            ctx.best_x = x;
+
+            double minCostFunctional = std::numeric_limits<double>::infinity();
+            lbfgs_params.mem_size = options.mem_size;
+            lbfgs_params.past = options.past;
+            lbfgs_params.min_step = 1.0e-32;
+            lbfgs_params.g_epsilon = 0.0;
+            lbfgs_params.delta = options.rel_cost_tol;
+            lbfgs_params.max_iterations = options.max_iterations;
+
+            int ret = lbfgs::LBFGS_CANCELED;
+            try
+            {
+                ret = lbfgs::lbfgs_optimize(x,
+                                            minCostFunctional,
+                                            &GCOPTER_PolytopeSFC::budgetedMINCOEnergyCostFunctional,
+                                            nullptr,
+                                            &GCOPTER_PolytopeSFC::budgetedLBFGSProgress,
+                                            &ctx,
+                                            lbfgs_params);
+            }
+            catch (const BudgetExceededException &)
+            {
+                ret = lbfgs::LBFGS_CANCELED;
+            }
+
+            result.wall_time =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx.start_time).count();
+            result.solver_status = ret;
+            result.iterations = ctx.iterations;
+            result.eval_count = ctx.eval_count;
+            result.evaluation_time = ctx.evaluation_time;
+            result.hit_eval_budget = ctx.hit_eval_budget;
+            result.hit_time_budget = ctx.hit_time_budget;
+            result.converged = (ret == lbfgs::LBFGS_CONVERGENCE || ret == lbfgs::LBFGS_STOP);
+
+            if (ctx.hit_time_budget)
+            {
+                result.status = "MINCO energy LBFGS wall-clock budget reached";
+            }
+            else if (ctx.hit_eval_budget)
+            {
+                result.status = "MINCO energy LBFGS evaluation budget reached";
+            }
+            else
+            {
+                result.status = std::string("MINCO energy LBFGS: ") + lbfgs::lbfgs_strerror(ret);
+            }
+
+            result.best_x = ctx.best_x.size() == getDecisionDim() ? ctx.best_x : x;
+            Trajectory<5> local_traj;
+            minco::MINCO_S3NU local_jerk_opt;
+            if (buildJerkOpt(result.best_x, local_jerk_opt))
+            {
+                Eigen::VectorXd grad_dummy(getDecisionDim());
+                result.objective = costFunctionalMINCOEnergy(this, result.best_x, grad_dummy);
+                local_jerk_opt.getTrajectory(local_traj);
+                result.has_solution =
+                    std::isfinite(result.objective) && local_traj.getPieceNum() > 0;
+                result.total_duration = local_traj.getTotalDuration();
+                result.trajectory_length =
+                    approximateTrajectoryLength(local_traj, std::max(8, 4 * integralRes));
+            }
+
+            return result;
+        }
+
+        inline SolverResult solveMINCOEnergyLBFGSOriginal(const Eigen::VectorXd &initialX,
+                                                          const double relCostTol)
+        {
+            LBFGSSolveOptions options;
+            options.rel_cost_tol = relCostTol;
+            return solveMINCOEnergyLBFGS(initialX, options);
         }
 
         inline SolverResult solveIGOXSpaceBenchmark(const Eigen::VectorXd &initialX,

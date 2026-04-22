@@ -97,9 +97,12 @@ namespace
             meta_options.meta_optimizer_collision_weight = 30.0;
             meta_options.meta_optimizer_velocity_weight = 20.0;
             meta_options.meta_optimizer_acceleration_weight = 25.0;
+            meta_options.meta_optimizer_jerk_weight = 2.0;
+            meta_options.meta_optimizer_energy_weight = 0.02;
             meta_options.meta_optimizer_time_weight = 4.0;
             meta_options.meta_optimizer_simple_max_velocity = 4.0;
             meta_options.meta_optimizer_simple_max_acceleration = 15.0;
+            meta_options.meta_optimizer_simple_max_jerk = 50.0;
             meta_options.meta_optimizer_target_velocity_ratio = 0.90;
             meta_options.meta_optimizer_time_lb = 0.10;
             meta_options.meta_optimizer_time_ub = 8.0;
@@ -599,6 +602,10 @@ namespace
         {
             cfg.meta_options.meta_optimizer_acceleration_weight = meta["acceleration_weight"].as<double>();
         }
+        if (meta && meta["jerk_weight"])
+        {
+            cfg.meta_options.meta_optimizer_jerk_weight = meta["jerk_weight"].as<double>();
+        }
         if (meta && meta["sample_dt"])
         {
             cfg.meta_options.meta_optimizer_sample_dt = meta["sample_dt"].as<double>();
@@ -622,6 +629,10 @@ namespace
         if (meta && meta["simple_max_acceleration"])
         {
             cfg.meta_options.meta_optimizer_simple_max_acceleration = meta["simple_max_acceleration"].as<double>();
+        }
+        if (meta && meta["simple_max_jerk"])
+        {
+            cfg.meta_options.meta_optimizer_simple_max_jerk = meta["simple_max_jerk"].as<double>();
         }
         if (meta && meta["target_velocity_ratio"])
         {
@@ -1083,9 +1094,11 @@ namespace
                     {
                         gcopter::GCOPTER_PolytopeSFC::IGOSolveOptions meta_pt_options = meta_options;
                         meta_pt_options.meta_optimizer_use_time_profile = false;
+                        meta_pt_options.meta_optimizer_use_nubs_direct = true;
+                        meta_pt_options.meta_optimizer_use_control_point_objective = true;
                         const gcopter::GCOPTER_PolytopeSFC::SolverResult meta_pt_result =
                             solver.solveMetaOptimizer(x0, meta_pt_options);
-                        appendResultRow(out, instance, "META_PT", static_cast<int>(cfg.meta_seeds[i]),
+                        appendResultRow(out, instance, "NUBS_META_PT", static_cast<int>(cfg.meta_seeds[i]),
                                         meta_pt_result, cfg.feasibility_tolerance);
                     }
                 }

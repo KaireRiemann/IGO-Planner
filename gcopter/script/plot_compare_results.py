@@ -60,7 +60,19 @@ def load_csv_rows(csv_path):
 
 
 def solver_order(solvers):
-    preferred = ["LBFGS", "IGO", "META", "META_PT", "IGO_XSPACE", "IGO_HEURISTIC"]
+    preferred = [
+        "LBFGS",
+        "MINCO_LBFGS",
+        "NUBS_ANALYTIC",
+        "NUBS_CENTER_DIFF",
+        "NUBS_META",
+        "IGO",
+        "META",
+        "NUBS_META_PT",
+        "META_PT",
+        "IGO_XSPACE",
+        "IGO_HEURISTIC",
+    ]
     ordered = [solver for solver in preferred if solver in solvers]
     extras = sorted(solver for solver in solvers if solver not in preferred)
     return ordered + extras
@@ -135,7 +147,7 @@ def compute_solver_means(rows):
     lbfgs_time = math.nan
     lbfgs_opt_time = math.nan
     for row in summary_rows:
-        if row["solver"] == "LBFGS":
+        if row["solver"] in ("LBFGS", "MINCO_LBFGS"):
             lbfgs_time = row.get("wall_time_sec", math.nan)
             lbfgs_opt_time = row.get("optimization_time_sec", math.nan)
             break
@@ -212,8 +224,13 @@ def plot_mean_metrics(plt, summary_rows, output_dir):
         x = np.arange(len(solvers))
         palette = {
             "LBFGS": "#0073F0",
+            "MINCO_LBFGS": "#0073F0",
+            "NUBS_ANALYTIC": "#00AFC8",
+            "NUBS_CENTER_DIFF": "#9467BD",
+            "NUBS_META": "#4C9F70",
             "IGO": "#FF7A00",
             "META": "#4C9F70",
+            "NUBS_META_PT": "#00AFC8",
             "META_PT": "#00AFC8",
             "IGO_XSPACE": "#9467BD",
             "IGO_HEURISTIC": "#8C564B",
@@ -222,7 +239,7 @@ def plot_mean_metrics(plt, summary_rows, output_dir):
         ax.set_title(title)
         ax.set_ylabel(ylabel)
         ax.set_xticks(x)
-        ax.set_xticklabels(solvers, rotation=20)
+        ax.set_xticklabels(solvers, rotation=25, ha="right")
         for idx, (row, value) in enumerate(zip(summary_rows, values)):
             if not math.isnan(value):
                 if label_mode == "time_components":
@@ -248,8 +265,13 @@ def trajectory_colors():
     return {
         "ROUTE": ("#808080", "--", 1.8),
         "LBFGS": ("#0073F0", "-", 2.6),
+        "MINCO_LBFGS": ("#0073F0", "-", 2.6),
+        "NUBS_ANALYTIC": ("#00AFC8", "-", 2.4),
+        "NUBS_CENTER_DIFF": ("#9467BD", "-", 2.4),
+        "NUBS_META": ("#4C9F70", "-", 2.6),
         "IGO": ("#FF7A00", "-", 2.6),
         "META": ("#4C9F70", "-", 2.6),
+        "NUBS_META_PT": ("#00AFC8", "-", 2.6),
         "META_PT": ("#00AFC8", "-", 2.6),
     }
 

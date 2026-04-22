@@ -41,3 +41,59 @@ SmoothingEps:               1.0e-2
 IntegralIntervs:            16
 
 RelCostTol:                 1.0e-5
+
+RunNUBSComparison:          true
+
+NUBSCompareOutput:          'auto'
+
+DiagnosticsSampleDt:        0.05
+
+NUBSMetaPopulation:         50
+
+NUBSMetaMaxIterations:      80
+
+NUBSMetaMaxEvaluations:     500
+
+NUBSMetaMaxWallTime:        0.0
+
+NUBSMetaSeed:               0
+
+NUBSMetaMidpoints:          4
+
+NUBSMetaUseTimeProfile:     false
+
+NUBSMetaSampleDt:           0.10
+
+NUBSMetaTimeWeight:         4.0
+
+NUBSMetaCollisionWeight:    30.0
+
+NUBSMetaVelocityWeight:     20.0
+
+NUBSMetaAccelerationWeight: 25.0
+
+NUBSMetaJerkWeight:         2.0
+
+NUBSMetaEnergyWeight:       0.02
+
+NUBSMetaTimeLowerBound:     0.10
+
+NUBSMetaTimeUpperBound:     8.0
+
+NUBSMetaSimpleMaxVelocity:  4.0
+
+NUBSMetaSimpleMaxAcceleration: 15.0
+
+NUBSMetaSimpleMaxJerk:      50.0
+
+NUBSMetaTargetVelocityRatio: 0.90
+
+NUBSMetaLocalBoxRadius:     2.0
+
+NUBSMetaTimeFloorScale:     1.10
+
+NUBSMetaInitialTimeScale:   1.18
+
+NUBSMetaTotalSlackMinScale: 0.04
+
+NUBSMetaTotalSlackMaxScale: 0.65

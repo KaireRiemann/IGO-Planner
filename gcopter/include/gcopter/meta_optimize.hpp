@@ -325,12 +325,7 @@ namespace gcopter
         SolverResult result;
         const bool use_time_profile = options.meta_optimizer_use_time_profile;
         const bool use_nubs_direct = options.meta_optimizer_use_nubs_direct;
-        const int requested_point_count =
-            std::max(0, options.meta_optimizer_midpoints);
-        const int point_count =
-            use_nubs_direct
-                ? std::max(requested_point_count, std::max(0, pieceN - 1))
-                : requested_point_count;
+        const int point_count = std::max(0, options.meta_optimizer_midpoints);
         const int direct_piece_num = point_count + 1;
         const int time_param_offset = 3 * point_count;
         const int gamma_offset = time_param_offset + direct_piece_num;
@@ -643,7 +638,8 @@ namespace gcopter
             [this, direct_piece_num](const Eigen::Matrix3Xd &candidate_points,
                                      const Eigen::VectorXd &candidate_times,
                                      bsplinetrajectory::NUBSTrajectory<3> &trajectory,
-                                     double &energy) -> bool
+                                     double &energy,
+                                     const bool compute_energy) -> bool
         {
             if (candidate_points.cols() != direct_piece_num - 1 ||
                 candidate_times.size() != direct_piece_num ||
@@ -662,7 +658,7 @@ namespace gcopter
             {
                 trajectory.generate(inner_points_rows, headPVA, tailPVA,
                                     candidate_times, control_points);
-                energy = trajectory.getEnergy();
+                energy = compute_energy ? trajectory.getEnergy() : 0.0;
             }
             catch (const std::exception &)
             {
@@ -671,6 +667,70 @@ namespace gcopter
             }
             return std::isfinite(energy) && trajectory.getPieceNum() > 0;
         };
+
+        std::vector<int> direct_span_corridor_idx(direct_piece_num, -1);
+        if (!hPolytopes.empty())
+        {
+            const int h_poly_count = static_cast<int>(hPolytopes.size());
+            auto fallback_poly_index =
+                [h_poly_count](const int span_idx,
+                               const int span_count) -> int
+            {
+                const double ratio =
+                    (static_cast<double>(span_idx) + 0.5) /
+                    static_cast<double>(std::max(1, span_count));
+                const int idx = static_cast<int>(
+                    std::floor(ratio * static_cast<double>(h_poly_count)));
+                return std::max(0, std::min(h_poly_count - 1, idx));
+            };
+
+            if (shortPath.cols() >= 2)
+            {
+                std::vector<double> arc_lengths(shortPath.cols(), 0.0);
+                for (int col = 1; col < shortPath.cols(); ++col)
+                {
+                    arc_lengths[col] =
+                        arc_lengths[col - 1] +
+                        (shortPath.col(col) - shortPath.col(col - 1)).norm();
+                }
+                const double total_arc = arc_lengths.back();
+                if (std::isfinite(total_arc) && total_arc > eps)
+                {
+                    auto poly_index_at_arc =
+                        [&arc_lengths, h_poly_count](const double arc) -> int
+                    {
+                        const auto iter =
+                            std::upper_bound(arc_lengths.begin(),
+                                             arc_lengths.end(),
+                                             arc);
+                        int segment =
+                            static_cast<int>(iter - arc_lengths.begin()) - 1;
+                        segment = std::max(0, segment);
+                        return std::max(0,
+                                        std::min(h_poly_count - 1, segment));
+                    };
+
+                    for (int span_idx = 0; span_idx < direct_piece_num; ++span_idx)
+                    {
+                        const double mid_arc =
+                            total_arc *
+                            (static_cast<double>(span_idx) + 0.5) /
+                            static_cast<double>(direct_piece_num);
+                        direct_span_corridor_idx[span_idx] =
+                            poly_index_at_arc(mid_arc);
+                    }
+                }
+            }
+
+            for (int span_idx = 0; span_idx < direct_piece_num; ++span_idx)
+            {
+                if (direct_span_corridor_idx[span_idx] < 0)
+                {
+                    direct_span_corridor_idx[span_idx] =
+                        fallback_poly_index(span_idx, direct_piece_num);
+                }
+            }
+        }
 
         auto evaluate_simple_sampled_candidate =
             [this, &options, &corridor_clearance,
@@ -914,10 +974,11 @@ namespace gcopter
         };
 
         auto evaluate_control_point_nubs_candidate =
-            [this, &options, direct_piece_num,
+            [this, &options, &direct_span_corridor_idx, direct_piece_num,
              simple_vel_max, simple_acc_max, eps](
                 const DirectNUBSCandidate &candidate,
-                TrajectoryViolationMetrics *metrics) -> double
+                TrajectoryViolationMetrics *metrics,
+                const bool include_exact_energy) -> double
         {
             typedef Eigen::Matrix<double, Eigen::Dynamic, 3> MatrixX3d;
 
@@ -984,8 +1045,10 @@ namespace gcopter
             }
             const double length_scale = std::max(eps, polyline_length);
             const double normalized_energy =
-                candidate.energy * std::pow(std::max(eps, total_time), 5.0) /
-                std::max(eps, length_scale * length_scale);
+                include_exact_energy && std::isfinite(candidate.energy)
+                    ? candidate.energy * std::pow(std::max(eps, total_time), 5.0) /
+                          std::max(eps, length_scale * length_scale)
+                    : 0.0;
 
             double collision_accum = 0.0;
             double collision_peak = 0.0;
@@ -1007,106 +1070,54 @@ namespace gcopter
                         continue;
                     }
 
-                    std::vector<int> nearby_poly_indices;
-                    auto add_poly_index =
-                        [&nearby_poly_indices](const int poly_idx) -> void
-                    {
-                        if (poly_idx < 0)
-                        {
-                            return;
-                        }
-                        if (std::find(nearby_poly_indices.begin(),
-                                      nearby_poly_indices.end(),
-                                      poly_idx) == nearby_poly_indices.end())
-                        {
-                            nearby_poly_indices.push_back(poly_idx);
-                        }
-                    };
                     const int piece_idx = span - degree;
-                    if (hPolyIdx.size() == pieceN &&
-                        direct_piece_num == pieceN)
+                    const int poly_idx =
+                        0 <= piece_idx &&
+                                piece_idx < static_cast<int>(direct_span_corridor_idx.size())
+                            ? direct_span_corridor_idx[piece_idx]
+                            : -1;
+                    if (poly_idx < 0 ||
+                        poly_idx >= static_cast<int>(hPolytopes.size()))
                     {
-                        for (int local_piece = piece_idx - 1;
-                             local_piece <= piece_idx + 1;
-                             ++local_piece)
-                        {
-                            if (0 <= local_piece && local_piece < hPolyIdx.size())
-                            {
-                                add_poly_index(hPolyIdx(local_piece));
-                            }
-                        }
-                    }
-                    else
-                    {
-                        const double ratio =
-                            (static_cast<double>(piece_idx) + 0.5) /
-                            static_cast<double>(std::max(1, direct_piece_num));
-                        const int center_poly =
-                            static_cast<int>(std::floor(
-                                ratio * static_cast<double>(hPolytopes.size())));
-                        for (int poly_idx = center_poly - 1;
-                             poly_idx <= center_poly + 1;
-                             ++poly_idx)
-                        {
-                            add_poly_index(poly_idx);
-                        }
+                        continue;
                     }
 
-                    double best_poly_cost =
-                        std::numeric_limits<double>::infinity();
-                    double best_poly_peak = 0.0;
-                    int best_term_count = 1;
-                    for (const int poly_idx : nearby_poly_indices)
+                    const PolyhedronH &h_poly = hPolytopes[poly_idx];
+                    double poly_cost = 0.0;
+                    double poly_peak = 0.0;
+                    int term_count = 0;
+                    for (int ctrl_idx = first_ctrl;
+                         ctrl_idx <= last_ctrl;
+                         ++ctrl_idx)
                     {
-                        if (poly_idx < 0 ||
-                            poly_idx >= static_cast<int>(hPolytopes.size()))
+                        const Eigen::Vector3d cp =
+                            control_points.row(ctrl_idx).transpose();
+                        for (int row = 0; row < h_poly.rows(); ++row)
                         {
-                            continue;
-                        }
-                        const PolyhedronH &h_poly = hPolytopes[poly_idx];
-                        double poly_cost = 0.0;
-                        double poly_peak = 0.0;
-                        int term_count = 0;
-                        for (int ctrl_idx = first_ctrl;
-                             ctrl_idx <= last_ctrl;
-                             ++ctrl_idx)
-                        {
-                            const Eigen::Vector3d cp =
-                                control_points.row(ctrl_idx).transpose();
-                            for (int row = 0; row < h_poly.rows(); ++row)
-                            {
-                                const double normal_norm =
-                                    std::max(eps,
-                                             h_poly.block<1, 3>(row, 0).norm());
-                                const double signed_distance =
-                                    (h_poly.block<1, 3>(row, 0).dot(cp) +
-                                     h_poly(row, 3)) /
-                                    normal_norm;
-                                const double violation =
-                                    std::max(0.0, signed_distance);
-                                poly_cost += violation * violation;
-                                poly_peak = std::max(poly_peak, violation);
-                                ++term_count;
-                            }
-                        }
-
-                        if (poly_cost < best_poly_cost)
-                        {
-                            best_poly_cost = poly_cost;
-                            best_poly_peak = poly_peak;
-                            best_term_count = std::max(1, term_count);
+                            const double normal_norm =
+                                std::max(eps,
+                                         h_poly.block<1, 3>(row, 0).norm());
+                            const double signed_distance =
+                                (h_poly.block<1, 3>(row, 0).dot(cp) +
+                                 h_poly(row, 3)) /
+                                normal_norm;
+                            const double violation =
+                                std::max(0.0, signed_distance);
+                            poly_cost += violation * violation;
+                            poly_peak = std::max(poly_peak, violation);
+                            ++term_count;
                         }
                     }
 
-                    if (std::isfinite(best_poly_cost))
+                    if (std::isfinite(poly_cost))
                     {
                         collision_accum +=
-                            best_poly_cost /
-                            static_cast<double>(std::max(1, best_term_count));
-                        collision_peak = std::max(collision_peak, best_poly_peak);
+                            poly_cost /
+                            static_cast<double>(std::max(1, term_count));
+                        collision_peak = std::max(collision_peak, poly_peak);
                         local_metrics.max_corridor_violation =
                             std::max(local_metrics.max_corridor_violation,
-                                     best_poly_peak);
+                                     poly_peak);
                         ++collision_span_count;
                     }
                 }
@@ -1133,59 +1144,39 @@ namespace gcopter
                           collision_peak * collision_peak
                     : 0.0;
 
-            auto derivative_control_points =
-                [eps](const bsplinetrajectory::NUBSTrajectory<3> &trajectory,
-                      const int derivative_order,
-                      MatrixX3d &derivative_points) -> bool
+            auto advance_derivative_points =
+                [eps, &knots, degree](const MatrixX3d &source_points,
+                                      const int derivative_order,
+                                      MatrixX3d &derivative_points) -> bool
             {
-                derivative_points = trajectory.getControlPoints();
-                const Eigen::VectorXd &local_knots = trajectory.getKnots();
-                const int local_degree = trajectory.getP();
-                if (derivative_order <= 0)
-                {
-                    return derivative_points.allFinite();
-                }
-                if (derivative_order > local_degree)
+                const int rows = source_points.rows();
+                if (rows <= 1 ||
+                    derivative_order <= 0 ||
+                    derivative_order > degree)
                 {
                     return false;
                 }
 
-                for (int derivative = 1;
-                     derivative <= derivative_order;
-                     ++derivative)
+                derivative_points.resize(rows - 1, 3);
+                const double scale =
+                    static_cast<double>(degree - derivative_order + 1);
+                for (int i = 0; i < rows - 1; ++i)
                 {
-                    const int rows = derivative_points.rows();
-                    if (rows <= 1)
+                    const int knot_lo = i + derivative_order;
+                    const int knot_hi = i + degree + 1;
+                    if (knot_lo < 0 ||
+                        knot_hi >= knots.size())
                     {
                         return false;
                     }
-
-                    MatrixX3d next(rows - 1, 3);
-                    const double scale =
-                        static_cast<double>(local_degree - derivative + 1);
-                    for (int i = 0; i < rows - 1; ++i)
+                    const double denominator = knots(knot_hi) - knots(knot_lo);
+                    if (!std::isfinite(denominator) || denominator <= eps)
                     {
-                        const int knot_lo = i + derivative;
-                        const int knot_hi = i + local_degree + 1;
-                        if (knot_lo < 0 ||
-                            knot_hi >= local_knots.size())
-                        {
-                            return false;
-                        }
-                        const double denominator =
-                            local_knots(knot_hi) - local_knots(knot_lo);
-                        if (!std::isfinite(denominator) ||
-                            denominator <= eps)
-                        {
-                            return false;
-                        }
-                        next.row(i) =
-                            scale *
-                            (derivative_points.row(i + 1) -
-                             derivative_points.row(i)) /
-                            denominator;
+                        return false;
                     }
-                    derivative_points.swap(next);
+                    derivative_points.row(i) =
+                        scale * (source_points.row(i + 1) - source_points.row(i)) /
+                        denominator;
                 }
 
                 return derivative_points.allFinite();
@@ -1220,10 +1211,9 @@ namespace gcopter
             MatrixX3d velocity_points;
             MatrixX3d acceleration_points;
             MatrixX3d jerk_points;
-            if (!derivative_control_points(candidate.trajectory, 1,
-                                           velocity_points) ||
-                !derivative_control_points(candidate.trajectory, 2,
-                                           acceleration_points))
+            if (!advance_derivative_points(control_points, 1, velocity_points) ||
+                !advance_derivative_points(velocity_points, 2, acceleration_points) ||
+                !advance_derivative_points(acceleration_points, 3, jerk_points))
             {
                 if (metrics)
                 {
@@ -1242,22 +1232,23 @@ namespace gcopter
             double jerk_cost = 0.0;
             const double jerk_weight =
                 std::max(0.0, options.meta_optimizer_jerk_weight);
-            if (jerk_weight > 0.0)
+            jerk_cost =
+                derivative_limit_cost(
+                    jerk_points,
+                    std::max(eps, options.meta_optimizer_simple_max_jerk),
+                    local_metrics.max_jerk_violation);
+
+            double surrogate_energy = 0.0;
+            if (jerk_points.rows() > 0)
             {
-                if (!derivative_control_points(candidate.trajectory, 3,
-                                               jerk_points))
+                for (int i = 0; i < jerk_points.rows(); ++i)
                 {
-                    if (metrics)
-                    {
-                        *metrics = TrajectoryViolationMetrics();
-                    }
-                    return std::numeric_limits<double>::infinity();
+                    surrogate_energy += jerk_points.row(i).squaredNorm();
                 }
-                jerk_cost =
-                    derivative_limit_cost(
-                        jerk_points,
-                        std::max(eps, options.meta_optimizer_simple_max_jerk),
-                        local_metrics.max_jerk_violation);
+                surrogate_energy =
+                    surrogate_energy / static_cast<double>(jerk_points.rows()) *
+                    total_time * std::pow(std::max(eps, total_time), 5.0) /
+                    std::max(eps, length_scale * length_scale);
             }
 
             const double time_cost =
@@ -1265,7 +1256,7 @@ namespace gcopter
                 total_time;
             const double energy_cost =
                 std::max(0.0, options.meta_optimizer_energy_weight) *
-                normalized_energy;
+                (include_exact_energy ? normalized_energy : surrogate_energy);
             const double collision_penalty =
                 std::max(0.0, options.meta_optimizer_collision_weight) *
                 collision_cost;
@@ -1289,7 +1280,23 @@ namespace gcopter
                 *metrics = local_metrics;
             }
 
-            return time_cost + energy_cost + local_metrics.penalty_cost;
+            const double max_violation = local_metrics.maxViolation();
+            const double feasibility_tol = std::max(0.0, options.feasibility_tol);
+            const double violation_l1 =
+                local_metrics.max_corridor_violation +
+                local_metrics.max_velocity_violation +
+                local_metrics.max_acceleration_violation +
+                local_metrics.max_jerk_violation;
+            const double violation_l2 =
+                collision_cost + velocity_cost + acceleration_cost + jerk_cost;
+            if (max_violation > feasibility_tol)
+            {
+                return 1.0e6 * max_violation +
+                       1.0e3 * violation_l1 +
+                       violation_l2;
+            }
+
+            return time_cost + energy_cost;
         };
 
         auto direct_to_x =
@@ -1311,7 +1318,7 @@ namespace gcopter
             if (use_nubs_direct)
             {
                 if (!build_direct_nubs(candidate_points, candidate_times,
-                                       direct_nubs, trajectory_energy))
+                                       direct_nubs, trajectory_energy, false))
                 {
                     return false;
                 }
@@ -1527,8 +1534,33 @@ namespace gcopter
         };
 
         std::vector<DirectCandidate> archive;
+        auto direct_candidate_less =
+            [](const DirectCandidate &lhs,
+               const DirectCandidate &rhs) -> bool
+        {
+            const bool lhs_finite = std::isfinite(lhs.cost);
+            const bool rhs_finite = std::isfinite(rhs.cost);
+            if (lhs_finite != rhs_finite)
+            {
+                return lhs_finite;
+            }
+            if (lhs.feasible != rhs.feasible)
+            {
+                return lhs.feasible;
+            }
+            if (!lhs.feasible && lhs.max_violation != rhs.max_violation)
+            {
+                return lhs.max_violation < rhs.max_violation;
+            }
+            if (lhs.cost != rhs.cost)
+            {
+                return lhs.cost < rhs.cost;
+            }
+            return lhs.max_violation < rhs.max_violation;
+        };
         auto insert_meta_candidate =
-            [&archive, archive_limit](const DirectCandidate &candidate) -> void
+            [&archive, archive_limit,
+             &direct_candidate_less](const DirectCandidate &candidate) -> void
         {
             if (!std::isfinite(candidate.cost))
             {
@@ -1536,30 +1568,7 @@ namespace gcopter
             }
 
             archive.push_back(candidate);
-            std::sort(archive.begin(), archive.end(),
-                      [](const DirectCandidate &lhs,
-                         const DirectCandidate &rhs) -> bool
-                      {
-                          const bool lhs_finite = std::isfinite(lhs.cost);
-                          const bool rhs_finite = std::isfinite(rhs.cost);
-                          if (lhs_finite != rhs_finite)
-                          {
-                              return lhs_finite;
-                          }
-                          if (lhs.feasible != rhs.feasible)
-                          {
-                              return lhs.feasible;
-                          }
-                          if (!lhs.feasible && lhs.max_violation != rhs.max_violation)
-                          {
-                              return lhs.max_violation < rhs.max_violation;
-                          }
-                          if (lhs.cost != rhs.cost)
-                          {
-                              return lhs.cost < rhs.cost;
-                          }
-                          return lhs.max_violation < rhs.max_violation;
-                      });
+            std::sort(archive.begin(), archive.end(), direct_candidate_less);
 
             const std::size_t limit =
                 static_cast<std::size_t>(std::max(1, archive_limit));
@@ -1613,7 +1622,7 @@ namespace gcopter
                 candidate.times = candidate_times;
                 if (!build_direct_nubs(candidate.points, candidate.times,
                                        candidate.trajectory,
-                                       candidate.energy))
+                                       candidate.energy, false))
                 {
                     evaluated.y = candidate_y;
                     evaluated.cost = std::numeric_limits<double>::infinity();
@@ -1627,7 +1636,8 @@ namespace gcopter
                 evaluated.cost =
                     options.meta_optimizer_use_control_point_objective
                         ? evaluate_control_point_nubs_candidate(candidate,
-                                                                &local_metrics)
+                                                                &local_metrics,
+                                                                false)
                         : evaluate_simple_nubs_candidate(candidate,
                                                          &local_metrics);
                 evaluated.max_violation = local_metrics.maxViolation();
@@ -1697,6 +1707,49 @@ namespace gcopter
         if (evaluate_direct_candidate(initial_y, initial_candidate))
         {
             insert_meta_candidate(initial_candidate);
+        }
+
+        if (use_nubs_direct &&
+            options.meta_optimizer_use_control_point_objective &&
+            !archive.empty())
+        {
+            for (DirectCandidate &elite : archive)
+            {
+                Eigen::Matrix3Xd elite_points;
+                Eigen::VectorXd elite_times;
+                if (!unpack_direct(elite.y, elite_points, elite_times))
+                {
+                    continue;
+                }
+
+                DirectNUBSCandidate elite_candidate;
+                elite_candidate.y = elite.y;
+                elite_candidate.points = elite_points;
+                elite_candidate.times = elite_times;
+                if (!build_direct_nubs(elite_candidate.points,
+                                       elite_candidate.times,
+                                       elite_candidate.trajectory,
+                                       elite_candidate.energy,
+                                       true))
+                {
+                    continue;
+                }
+
+                TrajectoryViolationMetrics elite_metrics;
+                const double exact_cost =
+                    evaluate_control_point_nubs_candidate(elite_candidate,
+                                                          &elite_metrics,
+                                                          true);
+                if (std::isfinite(exact_cost))
+                {
+                    elite.cost = exact_cost;
+                    elite.max_violation = elite_metrics.maxViolation();
+                    elite.feasible =
+                        elite.max_violation <=
+                        std::max(0.0, options.feasibility_tol);
+                }
+            }
+            std::sort(archive.begin(), archive.end(), direct_candidate_less);
         }
 
         const DirectCandidate *best_direct = nullptr;
@@ -1787,13 +1840,15 @@ namespace gcopter
                         if (build_direct_nubs(final_candidate.points,
                                               final_candidate.times,
                                               final_candidate.trajectory,
-                                              final_candidate.energy))
+                                              final_candidate.energy,
+                                              true))
                         {
                             result.objective =
                                 options.meta_optimizer_use_control_point_objective
                                     ? evaluate_control_point_nubs_candidate(
                                           final_candidate,
-                                          &result.violations)
+                                          &result.violations,
+                                          true)
                                     : evaluate_simple_nubs_candidate(
                                           final_candidate,
                                           &result.violations);

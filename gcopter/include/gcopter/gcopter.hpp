@@ -919,6 +919,301 @@ namespace gcopter
             }
         }
 
+        static inline void attachNUBSPenaltyFunctionalCostOnly(
+            const bsplinetrajectory::NUBSTrajectory<3> &traj,
+            const Eigen::VectorXd &T,
+            const Eigen::VectorXi &hIdx,
+            const PolyhedraH &hPolys,
+            const double &smoothFactor,
+            const int &integralResolution,
+            const Eigen::VectorXd &magnitudeBounds,
+            const Eigen::VectorXd &penaltyWeights,
+            flatness::FlatnessMap &flatMap,
+            double &cost,
+            TrajectoryViolationMetrics *metrics)
+        {
+            const double velSqrMax = magnitudeBounds(0) * magnitudeBounds(0);
+            const double omgSqrMax = magnitudeBounds(1) * magnitudeBounds(1);
+            const double thetaMax = magnitudeBounds(2);
+            const double thrustMean = 0.5 * (magnitudeBounds(3) + magnitudeBounds(4));
+            const double thrustRadi = 0.5 * fabs(magnitudeBounds(4) - magnitudeBounds(3));
+            const double thrustSqrRadi = thrustRadi * thrustRadi;
+
+            const double weightPos = penaltyWeights(0);
+            const double weightVel = penaltyWeights(1);
+            const double weightOmg = penaltyWeights(2);
+            const double weightTheta = penaltyWeights(3);
+            const double weightThrust = penaltyWeights(4);
+
+            if (metrics)
+            {
+                *metrics = TrajectoryViolationMetrics();
+            }
+
+            if (traj.getPieceNum() <= 0 ||
+                T.size() != traj.getPieceNum() ||
+                hIdx.size() != T.size() ||
+                hPolys.empty())
+            {
+                return;
+            }
+
+            double t0 = 0.0;
+            const int pieceNum = T.size();
+            const double integralFrac =
+                1.0 / static_cast<double>(std::max(1, integralResolution));
+            for (int i = 0; i < pieceNum; ++i)
+            {
+                const double step = T(i) * integralFrac;
+                const int poly_idx =
+                    std::max(0,
+                             std::min(static_cast<int>(hPolys.size()) - 1,
+                                      hIdx(i)));
+                const PolyhedronH &h_poly = hPolys[poly_idx];
+                for (int j = 0; j <= integralResolution; ++j)
+                {
+                    const double t = t0 + static_cast<double>(j) * step;
+                    const Eigen::Vector3d pos = traj.evaluate(t, 0);
+                    const Eigen::Vector3d vel = traj.evaluate(t, 1);
+                    const Eigen::Vector3d acc = traj.evaluate(t, 2);
+                    const Eigen::Vector3d jer = traj.evaluate(t, 3);
+
+                    double thr = 0.0;
+                    double cosTheta = 1.0;
+                    Eigen::Vector4d quat;
+                    Eigen::Vector3d omg;
+                    flatMap.forward(vel, acc, jer, 0.0, 0.0,
+                                    thr, quat, omg);
+
+                    const double violaVel = vel.squaredNorm() - velSqrMax;
+                    const double violaOmg = omg.squaredNorm() - omgSqrMax;
+                    cosTheta = 1.0 - 2.0 * (quat(1) * quat(1) + quat(2) * quat(2));
+                    cosTheta = std::max(-1.0, std::min(1.0, cosTheta));
+                    const double violaTheta = acos(cosTheta) - thetaMax;
+                    const double violaThrust =
+                        (thr - thrustMean) * (thr - thrustMean) - thrustSqrRadi;
+
+                    double pena = 0.0;
+                    double dummyGrad = 0.0;
+                    double penalty = 0.0;
+                    double max_pos_violation = 0.0;
+                    for (int row = 0; row < h_poly.rows(); ++row)
+                    {
+                        const Eigen::Vector3d outerNormal =
+                            h_poly.block<1, 3>(row, 0);
+                        const double violaPos =
+                            outerNormal.dot(pos) + h_poly(row, 3);
+                        if (smoothedL1(violaPos, smoothFactor,
+                                       penalty, dummyGrad))
+                        {
+                            pena += weightPos * penalty;
+                        }
+                        max_pos_violation =
+                            std::max(max_pos_violation, std::max(0.0, violaPos));
+                    }
+
+                    if (smoothedL1(violaVel, smoothFactor, penalty, dummyGrad))
+                    {
+                        pena += weightVel * penalty;
+                    }
+                    if (smoothedL1(violaOmg, smoothFactor, penalty, dummyGrad))
+                    {
+                        pena += weightOmg * penalty;
+                    }
+                    if (smoothedL1(violaTheta, smoothFactor, penalty, dummyGrad))
+                    {
+                        pena += weightTheta * penalty;
+                    }
+                    if (smoothedL1(violaThrust, smoothFactor, penalty, dummyGrad))
+                    {
+                        pena += weightThrust * penalty;
+                    }
+
+                    const double node =
+                        (j == 0 || j == integralResolution) ? 0.5 : 1.0;
+                    cost += node * step * pena;
+
+                    if (metrics)
+                    {
+                        metrics->penalty_cost += node * step * pena;
+                        metrics->max_corridor_violation =
+                            std::max(metrics->max_corridor_violation,
+                                     max_pos_violation);
+                        metrics->max_velocity_violation =
+                            std::max(metrics->max_velocity_violation,
+                                     std::max(0.0, vel.norm() - magnitudeBounds(0)));
+                        metrics->max_body_rate_violation =
+                            std::max(metrics->max_body_rate_violation,
+                                     std::max(0.0, omg.norm() - magnitudeBounds(1)));
+                        metrics->max_tilt_violation =
+                            std::max(metrics->max_tilt_violation,
+                                     std::max(0.0, violaTheta));
+                        metrics->max_thrust_violation =
+                            std::max(metrics->max_thrust_violation,
+                                     std::max(std::max(0.0, magnitudeBounds(3) - thr),
+                                              std::max(0.0, thr - magnitudeBounds(4))));
+                        ++metrics->sample_count;
+                    }
+                }
+                t0 += T(i);
+            }
+        }
+
+        static inline void attachNUBSControlPointPenaltyFunctional(
+            const Eigen::MatrixXd &controlPoints,
+            const Eigen::VectorXd &knots,
+            const int degree,
+            const Eigen::VectorXi &hIdx,
+            const PolyhedraH &hPolys,
+            const double &smoothFactor,
+            const Eigen::VectorXd &magnitudeBounds,
+            const Eigen::VectorXd &penaltyWeights,
+            double &cost,
+            TrajectoryViolationMetrics *metrics,
+            Eigen::MatrixXd *gradByControlPoints)
+        {
+            const double eps = positiveEps();
+            if (metrics)
+            {
+                *metrics = TrajectoryViolationMetrics();
+            }
+
+            if (controlPoints.rows() <= 0 ||
+                controlPoints.cols() != 3 ||
+                knots.size() <= degree + 1 ||
+                degree <= 0 ||
+                !controlPoints.allFinite() ||
+                !knots.allFinite())
+            {
+                return;
+            }
+
+            if (gradByControlPoints &&
+                (gradByControlPoints->rows() != controlPoints.rows() ||
+                 gradByControlPoints->cols() != controlPoints.cols()))
+            {
+                gradByControlPoints->setZero(controlPoints.rows(), controlPoints.cols());
+            }
+
+            const double weightPos = penaltyWeights(0);
+            const double weightVel = penaltyWeights(1);
+            const double velSqrMax = magnitudeBounds(0) * magnitudeBounds(0);
+            const int numCtrl = controlPoints.rows();
+
+            double penalty = 0.0;
+            double gradPenalty = 0.0;
+            if (!hPolys.empty() && hIdx.size() > 0)
+            {
+                for (int span = degree; span < knots.size() - degree - 1; ++span)
+                {
+                    const double spanDuration = knots(span + 1) - knots(span);
+                    if (!std::isfinite(spanDuration) || spanDuration <= eps)
+                    {
+                        continue;
+                    }
+
+                    const int pieceIdxLocal = span - degree;
+                    if (pieceIdxLocal < 0 || pieceIdxLocal >= hIdx.size())
+                    {
+                        continue;
+                    }
+                    const int polyIdx =
+                        std::max(0,
+                                 std::min(static_cast<int>(hPolys.size()) - 1,
+                                          hIdx(pieceIdxLocal)));
+                    const PolyhedronH &hPoly = hPolys[polyIdx];
+                    const double spanWeight =
+                        spanDuration / static_cast<double>(degree + 1);
+
+                    const int firstCtrl = std::max(0, span - degree);
+                    const int lastCtrl = std::min(numCtrl - 1, span);
+                    for (int ctrlIdx = firstCtrl; ctrlIdx <= lastCtrl; ++ctrlIdx)
+                    {
+                        const Eigen::Vector3d cp =
+                            controlPoints.row(ctrlIdx).transpose();
+                        for (int row = 0; row < hPoly.rows(); ++row)
+                        {
+                            const Eigen::Vector3d normal =
+                                hPoly.block<1, 3>(row, 0).transpose();
+                            const double violaPos =
+                                normal.dot(cp) + hPoly(row, 3);
+                            if (smoothedL1(violaPos, smoothFactor,
+                                           penalty, gradPenalty))
+                            {
+                                const double weighted =
+                                    spanWeight * weightPos;
+                                cost += weighted * penalty;
+                                if (gradByControlPoints)
+                                {
+                                    gradByControlPoints->row(ctrlIdx) +=
+                                        weighted * gradPenalty * normal.transpose();
+                                }
+                            }
+                            if (metrics)
+                            {
+                                metrics->max_corridor_violation =
+                                    std::max(metrics->max_corridor_violation,
+                                             std::max(0.0, violaPos));
+                                ++metrics->sample_count;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (numCtrl >= 2 && magnitudeBounds.size() > 0)
+            {
+                const double totalTime =
+                    numCtrl < knots.size()
+                        ? std::max(eps, knots(numCtrl))
+                        : std::max(eps, knots.maxCoeff() - knots.minCoeff());
+                const double velWeight =
+                    totalTime / static_cast<double>(std::max(1, numCtrl - 1));
+                for (int i = 0; i < numCtrl - 1; ++i)
+                {
+                    const int knotLo = i + 1;
+                    const int knotHi = i + degree + 1;
+                    if (knotLo < 0 || knotHi >= knots.size())
+                    {
+                        continue;
+                    }
+                    const double denom = knots(knotHi) - knots(knotLo);
+                    if (!std::isfinite(denom) || denom <= eps)
+                    {
+                        continue;
+                    }
+
+                    const Eigen::RowVector3d vel =
+                        static_cast<double>(degree) *
+                        (controlPoints.row(i + 1) - controlPoints.row(i)) /
+                        denom;
+                    const double violaVel = vel.squaredNorm() - velSqrMax;
+                    if (smoothedL1(violaVel, smoothFactor,
+                                   penalty, gradPenalty))
+                    {
+                        const double weighted = velWeight * weightVel;
+                        cost += weighted * penalty;
+                        if (gradByControlPoints)
+                        {
+                            const Eigen::RowVector3d gradVel =
+                                weighted * gradPenalty * 2.0 * vel;
+                            const double coeff =
+                                static_cast<double>(degree) / denom;
+                            gradByControlPoints->row(i) -= coeff * gradVel;
+                            gradByControlPoints->row(i + 1) += coeff * gradVel;
+                        }
+                    }
+                    if (metrics)
+                    {
+                        metrics->max_velocity_violation =
+                            std::max(metrics->max_velocity_violation,
+                                     std::max(0.0, vel.norm() - magnitudeBounds(0)));
+                        ++metrics->sample_count;
+                    }
+                }
+            }
+        }
+
         static inline void accumulateViolationIntegrals(const Eigen::VectorXd &T,
                                                         const Eigen::MatrixX3d &coeffs,
                                                         const Eigen::VectorXi &hIdx,
@@ -1385,6 +1680,7 @@ namespace gcopter
             const int dimTau = obj.temporalDim;
             const int dimXi = obj.spatialDim;
             const double weightT = obj.rho;
+
             const auto generate_start = std::chrono::steady_clock::now();
             Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
             Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
@@ -1410,6 +1706,12 @@ namespace gcopter
 
             const auto coeff_grad_start = std::chrono::steady_clock::now();
             obj.nubs.getEnergyPartialGradByCoeffs(cost, obj.nubsGradByCoeffs);
+            TrajectoryViolationMetrics unused_metrics;
+            attachNUBSControlPointPenaltyFunctional(
+                obj.nubs.getControlPoints(), obj.nubs.getKnots(), obj.nubs.getP(),
+                obj.hPolyIdx, obj.hPolytopes,
+                obj.smoothEps, obj.magnitudeBd, obj.penaltyWt,
+                cost, &unused_metrics, &obj.nubsGradByCoeffs);
             if (timing)
             {
                 timing->coeff_grad_time +=
@@ -1421,6 +1723,41 @@ namespace gcopter
             const auto time_grad_start = std::chrono::steady_clock::now();
             obj.nubs.getEnergyPartialGradByTimesFiniteDiff(obj.times,
                                                            obj.nubsGradByTimesDirect);
+            const double cp_time_eps = 1.0e-5;
+            for (int i = 0; i < obj.times.size(); ++i)
+            {
+                Eigen::VectorXd T_p = obj.times;
+                Eigen::VectorXd T_m = obj.times;
+                T_p(i) += cp_time_eps;
+                T_m(i) = std::max(1.0e-8, T_m(i) - cp_time_eps);
+
+                double cost_p = 0.0;
+                const Eigen::VectorXd knots_p =
+                    obj.nubs.generateKnots(T_p, obj.nubs.getControlPoints().rows());
+                attachNUBSControlPointPenaltyFunctional(
+                    obj.nubs.getControlPoints(), knots_p, obj.nubs.getP(),
+                    obj.hPolyIdx, obj.hPolytopes,
+                    obj.smoothEps, obj.magnitudeBd, obj.penaltyWt,
+                    cost_p, nullptr, nullptr);
+
+                double cost_m = 0.0;
+                const Eigen::VectorXd knots_m =
+                    obj.nubs.generateKnots(T_m, obj.nubs.getControlPoints().rows());
+                attachNUBSControlPointPenaltyFunctional(
+                    obj.nubs.getControlPoints(), knots_m, obj.nubs.getP(),
+                    obj.hPolyIdx, obj.hPolytopes,
+                    obj.smoothEps, obj.magnitudeBd, obj.penaltyWt,
+                    cost_m, nullptr, nullptr);
+
+                const double denom = T_p(i) - T_m(i);
+                if (std::isfinite(cost_p) &&
+                    std::isfinite(cost_m) &&
+                    denom > 0.0)
+                {
+                    obj.nubsGradByTimesDirect(i) +=
+                        (cost_p - cost_m) / denom;
+                }
+            }
             if (timing)
             {
                 timing->time_grad_time +=
@@ -2219,6 +2556,128 @@ namespace gcopter
             return cost;
         }
 
+        inline double evaluateNUBSObjectiveOnly(
+            const Eigen::VectorXd &x,
+            TrajectoryViolationMetrics *metrics = nullptr,
+            bsplinetrajectory::NUBSTrajectory<3> *traj = nullptr)
+        {
+            if (x.size() != getDecisionDim())
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            if (metrics)
+            {
+                *metrics = TrajectoryViolationMetrics();
+            }
+
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), temporalDim);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + temporalDim, spatialDim);
+
+            forwardT(tau, times);
+            forwardP(xi, vPolyIdx, vPolytopes, points);
+
+            if (times.size() != pieceN ||
+                points.cols() != pieceN - 1 ||
+                !times.allFinite() ||
+                !points.allFinite() ||
+                (times.array() <= positiveEps()).any())
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            try
+            {
+                const Eigen::MatrixXd inner_points_rows =
+                    points.cols() > 0 ? points.transpose()
+                                      : Eigen::MatrixXd(0, 3);
+                nubs.generate(inner_points_rows, headPVA, tailPVA,
+                              times, nubsControlPoints);
+            }
+            catch (const std::exception &)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            double cost = nubs.getEnergy();
+            attachNUBSPenaltyFunctionalCostOnly(nubs, nubs.getDurations(),
+                                                hPolyIdx, hPolytopes,
+                                                smoothEps, integralRes,
+                                                magnitudeBd, penaltyWt,
+                                                flatmap, cost, metrics);
+
+            cost += rho * times.sum();
+            normRetrictionLayerCostOnly(xi, vPolyIdx, vPolytopes, cost);
+
+            if (traj)
+            {
+                *traj = nubs;
+            }
+
+            return cost;
+        }
+
+        inline double evaluateNUBSControlPointObjectiveOnly(
+            const Eigen::VectorXd &x,
+            TrajectoryViolationMetrics *metrics = nullptr,
+            bsplinetrajectory::NUBSTrajectory<3> *traj = nullptr)
+        {
+            if (x.size() != getDecisionDim())
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            if (metrics)
+            {
+                *metrics = TrajectoryViolationMetrics();
+            }
+
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), temporalDim);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + temporalDim, spatialDim);
+
+            forwardT(tau, times);
+            forwardP(xi, vPolyIdx, vPolytopes, points);
+
+            if (times.size() != pieceN ||
+                points.cols() != pieceN - 1 ||
+                !times.allFinite() ||
+                !points.allFinite() ||
+                (times.array() <= positiveEps()).any())
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            try
+            {
+                const Eigen::MatrixXd inner_points_rows =
+                    points.cols() > 0 ? points.transpose()
+                                      : Eigen::MatrixXd(0, 3);
+                nubs.generate(inner_points_rows, headPVA, tailPVA,
+                              times, nubsControlPoints);
+            }
+            catch (const std::exception &)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            double cost = nubs.getEnergy();
+            attachNUBSControlPointPenaltyFunctional(
+                nubs.getControlPoints(), nubs.getKnots(), nubs.getP(),
+                hPolyIdx, hPolytopes,
+                smoothEps, magnitudeBd, penaltyWt,
+                cost, metrics, nullptr);
+
+            cost += rho * times.sum();
+            normRetrictionLayerCostOnly(xi, vPolyIdx, vPolytopes, cost);
+
+            if (traj)
+            {
+                *traj = nubs;
+            }
+
+            return cost;
+        }
+
         inline bool buildJerkOpt(const Eigen::VectorXd &x,
                                  minco::MINCO_S3NU &jerkOpt) const
         {
@@ -2511,8 +2970,10 @@ namespace gcopter
             bsplinetrajectory::NUBSTrajectory<3> local_traj;
             if (buildNUBSTrajectory(result.best_x, local_traj))
             {
-                Eigen::VectorXd grad_dummy(getDecisionDim());
-                result.objective = costFunctionalNUBS(this, result.best_x, grad_dummy);
+                result.objective =
+                    evaluateNUBSObjectiveOnly(result.best_x,
+                                              &result.violations,
+                                              &local_traj);
                 result.has_solution = std::isfinite(result.objective);
                 result.total_duration = local_traj.getTotalDuration();
                 result.trajectory_length =
@@ -2605,9 +3066,10 @@ namespace gcopter
             bsplinetrajectory::NUBSTrajectory<3> local_traj;
             if (buildNUBSTrajectory(result.best_x, local_traj))
             {
-                Eigen::VectorXd grad_dummy(getDecisionDim());
                 result.objective =
-                    costFunctionalNUBSFiniteDiff(this, result.best_x, grad_dummy);
+                    evaluateNUBSControlPointObjectiveOnly(result.best_x,
+                                                          &result.violations,
+                                                          &local_traj);
                 result.has_solution = std::isfinite(result.objective);
                 result.total_duration = local_traj.getTotalDuration();
                 result.trajectory_length =
